@@ -148,6 +148,10 @@ if d.get("interrupted"):
           % d["interrupted"].get("themeBefore", "unknown"))
 if not d.get("ready"):
     print("\n  %s" % (d.get("headline") or "Something is outstanding."))
+# Printed even when everything passes, because that is exactly when it matters:
+# nothing is wrong yet.
+if d.get("warning"):
+    print("\n  !! %s" % d["warning"])
 PYEOF
   python3 -c "import json,sys; sys.exit(0 if json.loads(sys.argv[1])['ready'] else 1)" "$json" && return 0
   confirm "Finish setting up OS 99 now?" || return 0

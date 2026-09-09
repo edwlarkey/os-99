@@ -35,26 +35,78 @@ STATE=$(os99_state_dir)
 # and os99-install can both read it, and the person at the keyboard is told
 # once. Once, not once per hook run: this fires on every theme switch too, and
 # a notification that repeats is a notification people learn to dismiss.
-note_plugin_ok() { rm -f "$STATE/plugin-failed" 2>/dev/null || true; }
+note_plugin_ok() {
+  rm -f "$STATE/plugin-failed" 2>/dev/null || true
+  note_rebuild_pending
+}
+
+# THE WARNING THAT ARRIVES BEFORE THE BREAKAGE.
+#
+# The plugin loaded, so nothing is wrong -- and if Hyprland has been upgraded
+# under this session, everything will be at the next login, because the
+# compositor that comes back will not be the one this .so was built against.
+# That is knowable now: the installed headers already say what the next
+# Hyprland will be.
+#
+# This hook runs on every theme switch, which is when somebody is at the
+# keyboard, so it is a good moment to say so. Once per ABI -- an upgrade is one
+# event no matter how many times the theme changes afterwards.
+note_rebuild_pending() {
+  local pending run hdr moved stamp
+  pending=$(os99_abi_pending) || return 0
+  run=${pending%%$'\t'*}; hdr=${pending##*$'\t'}
+  moved=$(os99_abi_diff "$run" "$hdr")
+  [[ -n $moved ]] || return 0
+  stamp="$STATE/pending-$hdr"
+  [[ -e $stamp ]] && return 0
+  : > "$stamp"
+  command -v omarchy-notification-send >/dev/null 2>&1 || return 0
+  omarchy-notification-send -u low -g 󰖯 \
+    "OS 99 frames need a rebuild after your next login" \
+    "Hyprland was upgraded ($moved). The frames work until you log out. Afterwards, run os99-hyprbars-rebuild." \
+    >/dev/null 2>&1 || true
+}
 
 note_plugin_failed() {
-  local now tag built_tag stamp
+  local now tag built_tag built_abi run_abi moved stamp
   now=$(hyprctl version 2>/dev/null | sed -n 's/.*at commit \([0-9a-f]\{7,\}\).*/\1/p' | head -1)
   tag=$(hyprctl version 2>/dev/null | sed -n 's/^Tag: \([^,]*\).*/\1/p' | head -1)
   built_tag=$(sed -n 's/^HYPRLAND_TAG=//p' "$BUILT" 2>/dev/null | head -1)
+  built_abi=$(os99_built_abi || true)
+  run_abi=$(os99_hypr_abi || true)
   {
     echo "SO=$SO"
     echo "RUNNING_COMMIT=$now"
     echo "RUNNING_TAG=$tag"
+    echo "RUNNING_ABI=$run_abi"
     echo "BUILT_TAG=$built_tag"
+    echo "BUILT_ABI=$built_abi"
     echo "AT=$(date -Is)"
   } > "$STATE/plugin-failed.tmp" && mv -f "$STATE/plugin-failed.tmp" "$STATE/plugin-failed"
 
-  stamp="$STATE/notified-${now:-unknown}"
+  # ONCE PER ABI, not once per commit.
+  #
+  # Keyed on the commit, a second break at the same commit is silent -- and
+  # that is not hypothetical: aquamarine 0.14 -> 0.15 on 2026-09-09 broke every
+  # plugin on the machine without moving the Hyprland commit or the tag. Anyone
+  # already notified once at efb5099 would have been told nothing at all.
+  stamp="$STATE/notified-${run_abi:-${now:-unknown}}"
   [[ -e $stamp ]] && return 0
   : > "$stamp"
   command -v omarchy-notification-send >/dev/null 2>&1 || return 0
-  if [[ -n $built_tag && -n $tag && $built_tag != "$tag" ]]; then
+  # The best wording the evidence supports, in order. The ABI names the real
+  # cause and is the only one of the three that can see a dependency-only bump;
+  # the tag is the readable story when no ABI was recorded (a build predating
+  # that field); the generic line is for a failure that is not a version pin.
+  moved=""
+  [[ -n $built_abi && -n $run_abi && $built_abi != "$run_abi" ]] &&
+    moved=$(os99_abi_diff "$built_abi" "$run_abi")
+  if [[ -n $moved ]]; then
+    omarchy-notification-send -u normal -g 󰖯 \
+      "OS 99 window frames are not loaded" \
+      "Hyprland's plugin ABI moved ($moved). Click OS 99 in the status bar to rebuild, or run os99-hyprbars-rebuild." \
+      >/dev/null 2>&1 || true
+  elif [[ -n $built_tag && -n $tag && $built_tag != "$tag" ]]; then
     omarchy-notification-send -u normal -g 󰖯 \
       "OS 99 window frames are not loaded" \
       "Built for Hyprland $built_tag, running $tag. Click OS 99 in the status bar to rebuild, or run os99-hyprbars-rebuild." \
@@ -135,20 +187,9 @@ os99_use_hyprland || true
 # The hashed-path scheme is still right for loading (Hyprland does not fully
 # dlclose, so a reused path returns stale code); it just cannot be trusted to
 # say what is resident. Ask the kernel instead.
-# Every libhyprbars any running Hyprland has open.
-#
-# The pid cannot be tied to a particular instance: Hyprland exports
-# HYPRLAND_INSTANCE_SIGNATURE to its CHILDREN but does not carry it in its own
-# environ, so there is nothing in /proc to match against. That is fine here.
-# The paths are only used as candidates -- the unload itself goes through
-# hyprctl, which already talks to the instance named by the signature, and
-# unloading a path that instance does not have resident is a harmless no-op.
-hyprbars_paths() {
-  local p
-  for p in $(pgrep -x Hyprland 2>/dev/null); do
-    grep -ho '/[^ ]*libhyprbars[^ ]*\.so' "/proc/$p/maps" 2>/dev/null
-  done | sort -u
-}
+# Every libhyprbars any running Hyprland has open: os99_hyprbars_paths, in
+# os99-lib.sh, because os99-hyprbars-rebuild has to answer the same question
+# before it can trust that its own unload did anything.
 
 unload_hyprbars() {
   local p found=0
@@ -156,7 +197,7 @@ unload_hyprbars() {
   while read -r p; do
     [[ -n $p ]] || continue
     hyprctl plugin unload "$p" >/dev/null 2>&1 && found=1
-  done < <(hyprbars_paths)
+  done < <(os99_hyprbars_paths)
 
   # Fallback: no readable maps anywhere. Try every build ever installed. One of
   # them is the right answer and the rest are no-ops.

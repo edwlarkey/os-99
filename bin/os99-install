@@ -247,9 +247,27 @@ if $STATUS; then
   BUILTF="$HOME/.local/lib/libhyprbars-os99.built"
   PLUGIN_REASON=""
   BUILT_TAG=""
+  ABI_MOVED=""
   RUN_TAG=$(hyprctl version 2>/dev/null | sed -n 's/^Tag: \([^,]*\).*/\1/p' | head -1)
   if ! $st_plugin; then
     BUILT_TAG=$(sed -n 's/^HYPRLAND_TAG=//p' "$BUILTF" 2>/dev/null | head -1)
+    # What the TAGS cannot tell you. Hyprland pins plugins to an ABI string
+    # that carries aquamarine, hyprutils, hyprgraphics, hyprcursor and hyprlang
+    # alongside the commit, so a distro rebuild can break every plugin on the
+    # machine while both tags still read v0.56.2. When that happens the tag
+    # comparison below finds no drift and this reports "the built plugin is not
+    # loading" -- true, unhelpful, and it made the 2026-09-09 breakage look
+    # like the theme had failed for no reason.
+    if _drift=$(os99_abi_stale); then
+      ABI_MOVED=$(os99_abi_diff "${_drift%%$'\t'*}" "${_drift##*$'\t'}")
+    fi
+  fi
+  # Asked whether the plugin is loaded or not. A working plugin plus an
+  # upgraded Hyprland is the interesting case: nothing is wrong yet and
+  # everything will be at the next login.
+  ABI_PENDING=""
+  if _p=$(os99_abi_pending); then
+    ABI_PENDING=$(os99_abi_diff "${_p%%$'\t'*}" "${_p##*$'\t'}")
     # .built is the precise answer and .path is the fallback: an install made
     # before .built existed still has a build pointer, and "you had this
     # working and an upgrade took it" is the right story for it either way.
@@ -269,6 +287,7 @@ if $STATUS; then
   DEPS=$st_deps FILES=$st_files ART=$st_art WIDGET=$st_widget PLUGIN=$st_plugin \
   THEME=$st_theme HYPRPM=$st_hyprpm URL="$(repo_url)" \
   REASON="$PLUGIN_REASON" BUILT_TAG="$BUILT_TAG" RUN_TAG="$RUN_TAG" \
+  ABI_MOVED="$ABI_MOVED" ABI_PENDING="$ABI_PENDING" \
   SESSION_OP="$SESSION_OP" SESSION_THEME="$SESSION_THEME" python3 -c '
 import json, os
 
@@ -278,12 +297,22 @@ def flag(name):
 reason = os.environ.get("REASON", "")
 built_tag = os.environ.get("BUILT_TAG", "")
 run_tag = os.environ.get("RUN_TAG", "")
+abi_moved = os.environ.get("ABI_MOVED", "")
+abi_pending = os.environ.get("ABI_PENDING", "")
 
+# The ABI is the pin, so it gets to speak first: "aq 0.14 -> 0.15" is the
+# actual reason the frames are gone. The tag comparison stays as the readable
+# fallback for a build made before the ABI was recorded.
 plugin_label = "window frames (hyprbars)"
 if reason == "stale":
-    plugin_label = ("window frames — built for Hyprland %s, running %s"
-                    % (built_tag, run_tag)) if built_tag and run_tag and built_tag != run_tag \
-                   else "window frames — the built plugin is not loading"
+    if abi_moved:
+        # No apostrophes in here: this whole program is inside single quotes.
+        plugin_label = "window frames — the Hyprland plugin ABI moved (%s)" % abi_moved
+    elif built_tag and run_tag and built_tag != run_tag:
+        plugin_label = ("window frames — built for Hyprland %s, running %s"
+                        % (built_tag, run_tag))
+    else:
+        plugin_label = "window frames — the built plugin is not loading"
 
 steps = [
     ("deps",   "python3 and hyprctl",       flag("DEPS"),   flag("DEPS"),
@@ -306,7 +335,9 @@ outstanding = [r["id"] for r in rows if not r["done"]]
 session_op = os.environ.get("SESSION_OP", "")
 session_theme = os.environ.get("SESSION_THEME", "")
 
-upgraded = bool(built_tag and run_tag and built_tag != run_tag)
+# "Hyprland was updated" is true of a dependency-only ABI bump too, and that
+# is the case the tags are blind to.
+upgraded = bool(abi_moved) or bool(built_tag and run_tag and built_tag != run_tag)
 if ready:
     headline, action = "", ""
 elif session_op == "remove":
@@ -321,8 +352,20 @@ elif outstanding == ["plugin"] and reason == "stale":
 else:
     headline, action = "Finish setting up OS 99", "Set up OS 99"
 
+# A warning is not a step. The steps describe what is true now -- and right now
+# the frames work -- so failing one of them would be a lie told to make a point.
+# This rides alongside instead, and everything that reads the status decides for
+# itself whether it has room to say so.
+warning = ""
+if abi_pending:
+    warning = ("Hyprland was upgraded (%s). The window frames will stop loading "
+               "at your next login. Log out, back in, then run "
+               "os99-hyprbars-rebuild." % abi_pending)
+
 print(json.dumps({
     "ready": ready,
+    "warning": warning,
+    "pendingRebuild": bool(abi_pending),
     "canFix": all(r["done"] or r["fixable"] for r in rows),
     "url": os.environ["URL"],
     "reason": reason,
@@ -493,6 +536,80 @@ SPEW
     cmp -s "$2/cfg.before" "$2/cfg.toml" || { echo "config changed across a round trip"; exit 1; }' \
     _ "$REPO_ROOT" "$TMP"
 
+  # The ABI pin. Both of these encode the 2026-09-09 failure: a dependency-only
+  # bump moved Hyprland's plugin ABI, the tag did not move with it, and every
+  # check in this project compared tags. The rebuild that was meant to fix it
+  # then did nothing, because the Makefile could not see a header change.
+  head_ "The ABI pin"
+  t "os99_abi_diff names only the fields that moved" bash -c '
+    source "$1/bin/os99-lib.sh"
+    a=deadbeef_aq_0.14_hu_0.14_hg_0.5
+    b=deadbeef_aq_0.15_hu_0.14_hg_0.5
+    got=$(os99_abi_diff "$a" "$b")
+    [[ $got == "aq 0.14 -> 0.15" ]] || { echo "got: $got"; exit 1; }
+    [[ -z $(os99_abi_diff "$a" "$a") ]] || { echo "reported drift between equals"; exit 1; }
+    exit 0' _ "$REPO_ROOT"
+  t "an unrecorded ABI is no opinion, not a failure" bash -c '
+    source "$1/bin/os99-lib.sh"
+    HOME=$2; mkdir -p "$2/.local/lib"
+    printf "SO=x\nHYPRLAND_TAG=v0.56.2\n" > "$2/.local/lib/libhyprbars-os99.built"
+    os99_built_abi >/dev/null 2>&1 && { echo "claimed to know an ABI it was not told"; exit 1; }
+    os99_abi_stale  >/dev/null 2>&1 && { echo "called a build stale on no evidence"; exit 1; }
+    exit 0' _ "$REPO_ROOT" "$TMP"
+  t "the Makefile rebuilds when Hyprland headers move" bash -c '
+    cd "$1/plugin/hyprbars" || exit 1
+    h=$(make -p 2>/dev/null | sed -n "s/^HYPR_VERSION_H := //p" | head -1)
+    [[ -n $h ]] || { echo "HYPR_VERSION_H did not resolve -- pkg-config cannot find hyprland?"; exit 1; }
+    [[ -f $h ]] || { echo "resolved to $h, which does not exist"; exit 1; }
+    grep -q "^\$(TARGET): \$(SRC) \$(HYPR_VERSION_H)" Makefile ||
+      { echo "version.h is not a prerequisite of the target"; exit 1; }
+    grep -q "INCLUDES) \$(SRC) -o" Makefile ||
+      { echo "the recipe passes \$^, which compiles version.h as a source"; exit 1; }
+    exit 0' _ "$REPO_ROOT"
+  t "the ABI is reassembled from version.h exactly as Hyprland writes it" bash -c '
+    source "$1/bin/os99-lib.sh"
+    mkdir -p "$2/inc"
+    cat > "$2/inc/version.h" <<HDR
+#define GIT_COMMIT_HASH    "deadbeefcafe0123456789abcdef0123456789ab"
+#define GIT_TAG            "v0.56.2"
+#define AQUAMARINE_VERSION "0.15.0"
+#define AQUAMARINE_VERSION_MAJOR 0
+#define AQUAMARINE_VERSION_MINOR 15
+#define AQUAMARINE_VERSION_PATCH 0
+#define HYPRLANG_VERSION     "0.6.8"
+#define HYPRUTILS_VERSION    "0.14.1"
+#define HYPRCURSOR_VERSION   "0.1.13"
+#define HYPRGRAPHICS_VERSION "0.5.1"
+HDR
+    # Inside a function $2 is the argument of THAT function, not of this
+    # script -- so the path has to be captured out here. (No apostrophes in
+    # any of these test bodies: they are single-quoted shell strings, and one
+    # stray quote ends the script early and scatters the rest as arguments.)
+    VH="$2/inc/version.h"
+    os99_hypr_version_h() { printf "%s\\n" "$VH"; }
+    got=$(os99_headers_abi)
+    want=deadbeefcafe0123456789abcdef0123456789ab_aq_0.15_hu_0.14_hg_0.5_hc_0.1_hlg_0.6
+    [[ $got == "$want" ]] || { echo "got:  $got"; echo "want: $want"; exit 1; }
+    exit 0' _ "$REPO_ROOT" "$TMP"
+  t "a version.h whose shape has moved is not reported as an upgrade" bash -c '
+    source "$1/bin/os99-lib.sh"
+    # Hyprland grows a field. The reconstruction is now wrong, and a wrong
+    # reconstruction differs from the running ABI forever -- so it must say
+    # nothing rather than warn on every boot.
+    os99_headers_abi() { printf "%s\\n" "abc_aq_0.15_hu_0.14_hg_0.5_hc_0.1_hlg_0.6_new_1.0"; }
+    os99_hypr_abi()    { printf "%s\\n" "abc_aq_0.15_hu_0.14_hg_0.5_hc_0.1_hlg_0.6"; }
+    os99_abi_pending >/dev/null 2>&1 && { echo "warned on a changed format"; exit 1; }
+    os99_headers_abi() { printf "%s\\n" "abc_aq_0.16_hu_0.14_hg_0.5_hc_0.1_hlg_0.6"; }
+    os99_abi_pending >/dev/null 2>&1 || { echo "missed a real pending upgrade"; exit 1; }
+    exit 0' _ "$REPO_ROOT"
+  t "os99_plugin_src finds the source from outside the checkout" bash -c '
+    source "$1/bin/os99-lib.sh"
+    got=$(cd / && OS99_PLUGIN_SRC="$1/plugin/hyprbars" os99_plugin_src) || { echo "found nothing"; exit 1; }
+    [[ $got == "$1/plugin/hyprbars" ]] || { echo "got: $got"; exit 1; }
+    OS99_PLUGIN_SRC="$2" os99_plugin_src >/dev/null 2>&1 &&
+      { echo "accepted a directory with no sources in it"; exit 1; }
+    exit 0' _ "$REPO_ROOT" "$TMP"
+
   head_ "Summary"
   printf '  %d passed, %d failed\n' "$passed" "$failed"
   (( failed == 0 )) || exit 1
@@ -644,6 +761,19 @@ else
   install -d "$HOME/.local/bin"
   for f in "$REPO"/bin/*; do install -m755 "$f" "$HOME/.local/bin/"; done
   good "scripts -> ~/.local/bin"
+  # REMEMBER WHERE TO REBUILD FROM.
+  #
+  # The scripts are now in ~/.local/bin, which is nowhere near the plugin
+  # source, and os99-hyprbars-rebuild resolved its source relative to itself --
+  # so the installed copy looked for ~/.local/plugin/hyprbars and could only
+  # ever fail. Recording the checkout here means `os99-hyprbars-rebuild` on
+  # $PATH is a command that works, which matters precisely when it is needed:
+  # after an upgrade has taken the frames away and nobody remembers where they
+  # cloned this.
+  if [[ -f $REPO/plugin/hyprbars/main.cpp ]]; then
+    printf '%s\n' "$REPO/plugin/hyprbars" > "$(os99_state_dir)/plugin-src"
+    good "rebuild source -> $REPO/plugin/hyprbars"
+  fi
 
   # Hooks go through omarchy's own installer when it exists, so they land
   # wherever it decides they belong; otherwise copy them ourselves.
@@ -683,6 +813,16 @@ else
                os99-widget-check os99-bar-menu; do
         install -m755 "$REPO/bin/$h" "$plugdir/bin/$h"
       done
+      # The frame source goes with them, for the same reason os99-install does:
+      # the widget offers "Rebuild window frames", and it can only honour that
+      # if there is something here to build. `omarchy plugin add` clones the
+      # whole repository and brings this along by itself; this is the other
+      # route saying the same thing.
+      if [[ -f $REPO/plugin/hyprbars/main.cpp ]]; then
+        install -d "$plugdir/plugin/hyprbars"
+        install -m644 "$REPO"/plugin/hyprbars/*.cpp "$REPO"/plugin/hyprbars/*.hpp \
+                      "$REPO/plugin/hyprbars/Makefile" "$plugdir/plugin/hyprbars/"
+      fi
       good "bar widget + helpers -> ~/.config/omarchy/plugins/$PLUGIN_ID"
     fi
     # The two widgets this one replaced. Leaving them would put the same count

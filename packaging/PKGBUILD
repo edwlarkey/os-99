@@ -106,6 +106,20 @@ PYEOF
   install -d "${pkgdir}/usr/share/os99/hooks"
   cp -r hooks/. "${pkgdir}/usr/share/os99/hooks/"
 
+  # 7. The frame plugin's SOURCE.
+  #
+  #    Odd-looking for a binary package, and it is 120K. It is here because
+  #    Hyprland plugins are ABI-pinned and the pin moves on dependency bumps,
+  #    not just Hyprland releases -- so the binary in 1. has a shelf life
+  #    measured in upgrades, and os99-hyprbars-rebuild is what people reach for
+  #    when it expires. Without this, the packaged copy of that script resolves
+  #    its source to /usr/plugin/hyprbars and can only print an error: a repair
+  #    tool that requires you to have kept the checkout it came from.
+  install -d "${pkgdir}/usr/share/os99/plugin/hyprbars"
+  install -m644 plugin/hyprbars/*.cpp plugin/hyprbars/*.hpp \
+                plugin/hyprbars/Makefile \
+                "${pkgdir}/usr/share/os99/plugin/hyprbars/"
+
   install -Dm644 plugin/LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 }

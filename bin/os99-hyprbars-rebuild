@@ -5,15 +5,20 @@
 # loading and the OS 9 window frames silently disappear. Re-run this, then
 # re-apply the theme.
 set -e
+_os99_lib="$(dirname -- "$(readlink -f "$0")")/os99-lib.sh"
+# shellcheck source=os99-lib.sh
+source "$_os99_lib" || { echo "os99-hyprbars-rebuild: missing $_os99_lib" >&2; exit 1; }
+
 # The plugin source now lives inside this repository rather than in a separate
-# fork checkout, so there is one place to build from. OS99_PLUGIN_SRC overrides.
-# The source, found relative to this script: from a checkout that is
-# ../plugin/hyprbars, and the installed plugin directory IS a checkout, so the
-# copy the bar widget runs finds it too. A personal path used to be hardcoded
-# here as the fallback, which worked on exactly one machine.
-SRC="${OS99_PLUGIN_SRC:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/plugin/hyprbars}"
-if [[ ! -d $SRC ]]; then
-  echo "os99-hyprbars-rebuild: no plugin source at $SRC" >&2
+# fork checkout, so there is one place to build from. os99_plugin_src knows
+# every place it can be -- checkout, package, omarchy plugin dir -- and
+# os99-install asks the same function, so there is one answer rather than two
+# that can drift. OS99_PLUGIN_SRC still overrides everything.
+if ! SRC=$(os99_plugin_src); then
+  echo "os99-hyprbars-rebuild: cannot find the hyprbars source." >&2
+  echo "  Looked beside this script (../plugin/hyprbars), in the state dir's" >&2
+  echo "  plugin-src pointer, in /usr/share/os99/plugin/hyprbars, and in the" >&2
+  echo "  omarchy plugin directory." >&2
   echo "  Run this from a checkout, or set OS99_PLUGIN_SRC to plugin/hyprbars." >&2
   exit 1
 fi
@@ -23,8 +28,24 @@ BUILT="$LIBDIR/libhyprbars-os99.built"   # names the Hyprland it was built FOR
 
 echo "Hyprland:      $(hyprctl version | head -1)"
 echo "pkg-config:    $(pkg-config --modversion hyprland)"
+echo "running ABI:   $(os99_hypr_abi || echo '(no compositor answering)')"
+echo "source:        $SRC"
 
 cd "$SRC"
+# CLEAN FIRST. Not thrift -- correctness.
+#
+# The Makefile now lists Hyprland's version.h as a prerequisite, so an ABI bump
+# with no source change does force a recompile. That dep is found through
+# pkg-config, though, and a pkg-config that cannot answer makes it EMPTY, which
+# is no prerequisite at all and restores exactly the bug it exists to fix:
+# make prints "Nothing to be done for 'all'" and everything below this happily
+# content-hashes and installs the STALE object under a fresh name, reporting
+# success. (2026-09-09, aquamarine 0.14 -> 0.15. The frames stayed gone and the
+# rebuild that was supposed to bring them back said it had worked.)
+#
+# This is a script somebody runs once per Hyprland upgrade. One full compile of
+# five files is the cheapest possible insurance against that.
+make clean >/dev/null
 make -j"$(nproc)" all
 
 # CRITICAL: every build gets its own filename, keyed by content hash.
@@ -100,11 +121,26 @@ NEW="$LIBDIR/libhyprbars-os99-$HASH.so"
 
 mkdir -p "$LIBDIR"
 
-# Unload whatever is live BEFORE repointing, while we still know its path.
+# Unload whatever is live BEFORE repointing.
+#
+# By the path the compositor actually has MAPPED, not the one the pointer file
+# names. Those diverge the moment a rebuild moves the pointer, and unload takes
+# the path a plugin was loaded FROM -- so unloading by the pointer is a no-op
+# that reports nothing, leaves the old code resident, and makes the load below
+# look like it succeeded when it was the previous build answering.
 if hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
-  OLD=$(cat "$PTR" 2>/dev/null || echo "$LIBDIR/libhyprbars-os99.so")
-  echo "unloading currently-loaded plugin: $OLD"
-  hyprctl plugin unload "$OLD" >/dev/null 2>&1 || true
+  while read -r _old; do
+    [[ -n $_old ]] || continue
+    echo "unloading currently-loaded plugin: $_old"
+    hyprctl plugin unload "$_old" >/dev/null 2>&1 || true
+  done < <(os99_hyprbars_paths)
+  # Fallback for an unreadable /proc: every build ever installed. One of them is
+  # the right answer and the rest are no-ops.
+  if hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
+    for _old in "$(cat "$PTR" 2>/dev/null)" "$LIBDIR"/libhyprbars-os99*.so; do
+      [[ -n $_old && -f $_old ]] && hyprctl plugin unload "$_old" >/dev/null 2>&1
+    done
+  fi
   sleep 1
 fi
 
@@ -118,8 +154,16 @@ echo "$NEW" > "$PTR"
 # Hyprland turns that into a diagnosis -- "built for v0.56.2, running v0.57.0"
 # -- which is the difference between a bar that offers to fix it and a desktop
 # that has quietly lost its title bars.
+#
+# HYPRLAND_ABI is the field that decides; the tag and commit are for wording.
+# The tag is not the pin and comparing it misses whole classes of breakage: on
+# 2026-09-09 aquamarine went 0.14 -> 0.15, every plugin on the machine stopped
+# loading, and the tag was v0.56.2 on both sides of it. Everything that asks
+# "is this build stale" now asks the ABI string, which is the literal thing
+# Hyprland compares the plugin against.
 {
   echo "SO=$NEW"
+  echo "HYPRLAND_ABI=$(os99_hypr_abi || true)"
   echo "HYPRLAND_COMMIT=$(hyprctl version 2>/dev/null | sed -n 's/.*at commit \([0-9a-f]\{7,\}\).*/\1/p' | head -1)"
   echo "HYPRLAND_TAG=$(hyprctl version 2>/dev/null | sed -n 's/^Tag: \([^,]*\).*/\1/p' | head -1)"
   echo "BUILT_AT=$(date -Is)"
@@ -135,4 +179,51 @@ echo "$NEW" > "$PTR"
 # is free. Sweep them by hand when no Hyprland that loaded them is running.
 
 echo "installed -> $NEW"
+
+# PROVE IT LOADS. "Installed" is not the claim anybody wants.
+#
+# Everything above this verifies the BUILD -- that every symbol resolves, that
+# no .cpp went missing. Nothing verified that the compositor would accept the
+# result, so a rebuild could print an unbroken run of successes and leave a
+# desktop with no window frames, which is exactly what happened on 2026-09-09.
+# The ABI pin is checkable in one call, so check it.
+#
+# THE TEST IS "is $NEW the resident library", not "is some hyprbars loaded".
+# Those differ, in both directions. os99-window-bars reloads the plugin on
+# hooks this script does not control, so the list can be non-empty again a
+# moment after the unload above -- and it can be non-empty because the OLD
+# build never left, which is the failure this step exists to catch. Asking
+# which path the compositor actually has open separates the two.
+#
+# Loading here is safe and not a half-measure: os99-window-bars unloads and
+# reloads unconditionally, so the theme re-apply below still does its own thing
+# afterwards. This just answers the question now instead of at the next login.
+if hyprctl version >/dev/null 2>&1; then
+  echo "verifying it loads..."
+  # An identical rebuild produces an identical hash and therefore the same
+  # path, which may already be resident. That is a pass, not a collision: the
+  # bytes are the ones we just built, so the handle Hyprland kept is our code.
+  if [[ $(os99_loaded_so 2>/dev/null) != "$NEW" ]]; then
+    hyprctl plugin load "$NEW" >/dev/null 2>&1 || true
+  fi
+  if hyprctl plugin list 2>/dev/null | grep -q hyprbars &&
+     [[ $(os99_loaded_so 2>/dev/null) == "$NEW" ]]; then
+    echo "  loaded"
+  else
+    echo "!! THE PLUGIN DID NOT LOAD. The frames will not come back." >&2
+    if drift=$(os99_abi_stale); then
+      built=${drift%%$'\t'*}; running=${drift##*$'\t'}
+      echo "   ABI mismatch: $(os99_abi_diff "$built" "$running")" >&2
+      echo "   built for: $built" >&2
+      echo "   running:   $running" >&2
+      echo "   The headers this built against are not the running compositor's." >&2
+      echo "   Log out and back in to pick up the upgraded Hyprland, then re-run." >&2
+    else
+      echo "   The ABI matches, so this is not a version pin. Check:" >&2
+      echo "     hyprctl plugin load $NEW" >&2
+    fi
+    exit 1
+  fi
+fi
+
 echo "Now: omarchy theme set \"$(omarchy theme current)\""

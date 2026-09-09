@@ -197,6 +197,228 @@ os99_so_stale() {
   printf '%s\n%s\n' "$live" "$newest"
 }
 
+# Every libhyprbars any running Hyprland has open, from /proc.
+#
+# Unload takes the path a plugin was loaded FROM, and that is not necessarily
+# the path the pointer file names: rebuilding writes a new content-hashed .so
+# and moves the pointer while the running Hyprland keeps the handle it dlopened
+# at load time. Unloading by the pointer therefore quietly does nothing once
+# the two diverge -- silently, because hyprctl's failure goes to /dev/null.
+# That is how OS 9 title bars once survived a switch to another theme.
+#
+# The pid cannot be tied to a particular instance: Hyprland exports
+# HYPRLAND_INSTANCE_SIGNATURE to its CHILDREN but does not carry it in its own
+# environ, so there is nothing in /proc to match against. That is fine -- these
+# are only candidates, and the unload itself goes through hyprctl, which
+# already talks to the instance named by the signature. Unloading a path that
+# instance does not have resident is a harmless no-op.
+os99_hyprbars_paths() {
+  local p
+  for p in $(pgrep -x Hyprland 2>/dev/null); do
+    grep -ho '/[^ ]*libhyprbars[^ ]*\.so' "/proc/$p/maps" 2>/dev/null
+  done | sort -u
+}
+
+# --------------------------------------------------------------- the ABI pin
+#
+# THE IDENTIFIER THAT ACTUALLY DECIDES whether the plugin loads.
+#
+# Hyprland compares the plugin's compiled-in HYPRLAND_API_VERSION against its
+# own, and that string is not the version anybody quotes:
+#
+#   efb5099...d9f_aq_0.15_hu_0.14_hg_0.5_hc_0.1_hlg_0.6
+#
+# -- the commit, plus aquamarine / hyprutils / hyprgraphics / hyprcursor /
+# hyprlang. So a distro rebuild that bumps ONLY aquamarine breaks every plugin
+# while `hyprctl version` still says v0.56.2 at commit efb5099.
+#
+# This mattered on 2026-09-09: the frames died, and every staleness check here
+# compared tags, saw v0.56.2 == v0.56.2, and reported no drift. Comparing the
+# ABI string turns "the frame plugin did not load" into a diagnosis and, better,
+# makes the answer knowable WITHOUT attempting a load -- so the bar can say the
+# frames are about to break rather than that they already have.
+os99_hypr_abi() {
+  local abi
+  abi=$(hyprctl version 2>/dev/null | sed -n 's/^Version ABI string: *//p' | head -1)
+  [[ -n $abi ]] || return 1
+  printf '%s\n' "$abi"
+}
+
+# The ABI the installed .so was built for, from the .built stamp. Absent for a
+# build made before this was recorded -- callers must treat "unknown" as "no
+# opinion" and fall back to the tag rather than crying stale at everyone whose
+# stamp predates the field.
+os99_built_abi() {
+  local abi
+  abi=$(sed -n 's/^HYPRLAND_ABI=//p' "$HOME/.local/lib/libhyprbars-os99.built" 2>/dev/null | head -1)
+  [[ -n $abi ]] || return 1
+  printf '%s\n' "$abi"
+}
+
+# Will the built plugin refuse to load into the running Hyprland? Prints
+# "built<TAB>running" when it will. Silent and non-zero when they match OR when
+# either is unknown: an unanswerable question is not evidence of breakage.
+os99_abi_stale() {
+  local built running
+  built=$(os99_built_abi)   || return 1
+  running=$(os99_hypr_abi)  || return 1
+  [[ $built != "$running" ]] || return 1
+  printf '%s\t%s\n' "$built" "$running"
+}
+
+# The human-sized difference between two ABI strings: just the fields that
+# moved, "aq 0.14 -> 0.15", because the full strings are 70 characters of
+# mostly-identical hex and a notification has room for neither.
+os99_abi_diff() {
+  local built="$1" running="$2"
+  BUILT="$built" RUNNING="$running" python3 -c '
+import os, re
+def fields(s):
+    head, *rest = s.split("_", 1)
+    out = {"commit": head[:7]}
+    if rest:
+        parts = rest[0].split("_")
+        out.update(dict(zip(parts[::2], parts[1::2])))
+    return out
+a, b = fields(os.environ["BUILT"]), fields(os.environ["RUNNING"])
+moved = [f"{k} {a.get(k, chr(63))} -> {b.get(k, chr(63))}"
+         for k in dict.fromkeys([*a, *b]) if a.get(k) != b.get(k)]
+print(", ".join(moved) if moved else "")
+' 2>/dev/null
+}
+
+# ---------------------------------------------------- the break BEFORE it lands
+#
+# Everything above answers "are the frames broken". This answers "are they
+# about to be", which is the question worth asking: an upgrade lands while the
+# session is still running the OLD compositor, so the plugin keeps working
+# until the next login and then does not. Told at the right moment that is a
+# one-line chore; discovered at the next login it is a desktop that has lost
+# every title bar for no visible reason.
+#
+# The running compositor reports its ABI. The INSTALLED HEADERS say what a
+# rebuild would produce, and after an upgrade those two disagree -- so their
+# disagreement is the upgrade, seen before the reboot that applies it.
+os99_hypr_version_h() {
+  local d
+  for d in $(pkg-config --cflags-only-I hyprland 2>/dev/null); do
+    d=${d#-I}
+    [[ -f $d/version.h ]] && { printf '%s\n' "$d/version.h"; return 0; }
+  done
+  return 1
+}
+
+# Reassembled from version.h the way Hyprland assembles it: the commit, then
+# aquamarine / hyprutils / hyprgraphics / hyprcursor / hyprlang as major.minor,
+# in that order. Duplicating somebody else's format is a thing that rots, so
+# nothing here is allowed to be load-bearing -- see the guard in
+# os99_abi_pending, which refuses to speak if the shape has moved.
+os99_headers_abi() {
+  local h
+  h=$(os99_hypr_version_h) || return 1
+  VERSION_H="$h" python3 -c '
+import os, re, sys
+t = open(os.environ["VERSION_H"]).read()
+def string(name):
+    m = re.search(r"#define\s+%s\s+\"([^\"]*)\"" % name, t)
+    return m.group(1) if m else None
+def number(name):
+    m = re.search(r"#define\s+%s\s+(\d+)" % name, t)
+    return m.group(1) if m else None
+def majmin(v):
+    p = (v or "").split(".")
+    return ".".join(p[:2]) if len(p) >= 2 else None
+commit = string("GIT_COMMIT_HASH")
+# aquamarine publishes split MAJOR/MINOR defines; the rest only a string.
+aq = None
+if number("AQUAMARINE_VERSION_MAJOR") and number("AQUAMARINE_VERSION_MINOR"):
+    aq = "%s.%s" % (number("AQUAMARINE_VERSION_MAJOR"), number("AQUAMARINE_VERSION_MINOR"))
+else:
+    aq = majmin(string("AQUAMARINE_VERSION"))
+fields = [("aq", aq),
+          ("hu",  majmin(string("HYPRUTILS_VERSION"))),
+          ("hg",  majmin(string("HYPRGRAPHICS_VERSION"))),
+          ("hc",  majmin(string("HYPRCURSOR_VERSION"))),
+          ("hlg", majmin(string("HYPRLANG_VERSION")))]
+if not commit or any(v is None for _, v in fields):
+    sys.exit(1)
+print(commit + "".join("_%s_%s" % (k, v) for k, v in fields))
+' 2>/dev/null
+}
+
+# The field NAMES of an ABI string, in order: "aq,hu,hg,hc,hlg".
+_os99_abi_keys() {
+  ABI="${1:-}" python3 -c '
+import os
+head, *rest = os.environ["ABI"].split("_", 1)
+parts = rest[0].split("_") if rest else []
+print(",".join(parts[::2]))
+' 2>/dev/null
+}
+
+# Has Hyprland been upgraded under a session that is still running the old one?
+# Prints "running<TAB>headers" when it has.
+#
+# Silent unless the two strings have the SAME SHAPE -- the same field names in
+# the same order -- because the only reason they would not is that upstream
+# changed the format and the reconstruction above is now wrong. A wrong
+# reconstruction differs from the running ABI on every single boot, which would
+# turn this into a warning that is always on and therefore never read. Refusing
+# to guess is the whole safety margin here.
+os99_abi_pending() {
+  local hdr run
+  hdr=$(os99_headers_abi) || return 1
+  run=$(os99_hypr_abi)    || return 1
+  [[ -n $hdr && -n $run && $hdr != "$run" ]] || return 1
+  [[ $(_os99_abi_keys "$hdr") == "$(_os99_abi_keys "$run")" ]] || return 1
+  printf '%s\t%s\n' "$run" "$hdr"
+}
+
+# ------------------------------------------------------ the plugin SOURCE dir
+#
+# Where to build FROM. This used to be one relative path -- ../plugin/hyprbars
+# from the script -- which is right only for a checkout. The packaged copy in
+# /usr/bin resolved it to /usr/plugin/hyprbars and the copy under
+# ~/.config/omarchy/plugins/<id>/bin to a directory os99-install never creates,
+# so `os99-hyprbars-rebuild` on $PATH was a command that could only fail. It
+# failed loudly, which is why it went unnoticed: the one route people actually
+# use is a dev checkout.
+#
+# So: ask several places, in the order that puts the most specific first.
+# A directory is not enough. os99-install's non-checkout route creates bin/
+# under the plugin directory without plugin/, and an empty directory would be
+# "found" here and then fail at make with a far worse message than this one.
+os99_is_plugin_src() {
+  [[ -n ${1:-} && -f $1/Makefile && -f $1/main.cpp ]]
+}
+
+os99_plugin_src() {
+  local here c
+  # An explicit override is checked, not trusted. Pointing this at the wrong
+  # directory should be a complaint about THAT directory -- falling through to
+  # the search would quietly build from a source other than the one asked for,
+  # which is the worse failure of the two.
+  if [[ -n ${OS99_PLUGIN_SRC:-} ]]; then
+    if os99_is_plugin_src "$OS99_PLUGIN_SRC"; then
+      printf '%s\n' "$OS99_PLUGIN_SRC"
+      return 0
+    fi
+    echo "os99: OS99_PLUGIN_SRC=$OS99_PLUGIN_SRC has no Makefile and main.cpp in it" >&2
+    return 1
+  fi
+  here=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd) || here=""
+  for c in ${here:+"$here/plugin/hyprbars"} \
+           "$(cat "$(os99_state_dir)/plugin-src" 2>/dev/null)" \
+           /usr/share/os99/plugin/hyprbars \
+           /usr/local/share/os99/plugin/hyprbars \
+           "$HOME/.config/omarchy/plugins/io.github.caariiboouu.os-99/plugin/hyprbars"; do
+    os99_is_plugin_src "$c" || continue
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
 # ----------------------------------------------------------------------- art
 #
 # Copy freshly drawn art into the LIVE theme.
