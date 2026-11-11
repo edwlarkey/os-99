@@ -1,190 +1,540 @@
 #!/bin/bash
-# OS 99, from a terminal.
+# OS 99 — Mac OS 9 Platinum window frames for Hyprland.
 #
-#   os99            the menu
-#   os99 windows    what is parked, and put it back
-#   os99 boxes      which boxes the title bar carries
-#   os99 status     what is set up and what is not
-#
-# WHY THIS EXISTS RATHER THAN A BAR WIDGET.
-#
-# Everything here used to be QML: a bar widget for the minimized-window list and
-# a popup menu for the boxes. Both ran inside omarchy-shell, which meant both
-# depended on Omarchy's own types -- Style, Color, PopupCard, the BarWidget base
-# -- and an update to any of those could stop them loading with nothing said.
-# Most of the machinery that watched for that failure existed because they did.
-#
-# A terminal cannot do the one thing a bar can: tell you a window is parked
-# without being asked. That glance was the argument for the widget, and it was
-# judged not worth what it cost. Everything else a menu does better.
-#
-# What still runs in the shell is the menu-bar font, and only that, because
-# Style.fontFamily can be set from nowhere else -- there is no family key in a
-# theme's shell.toml and OMARCHY_MENU_FONT reaches the popups but not the bar.
-# It is a headless service now, with no bar presence at all.
+#   ./install                 first time, and every upgrade
+#   os99                      status
+#   os99 apply                load frames (Hyprland runs this on start/reload)
+#   os99 reload               redraw art after editing os99-theme.toml
+#   os99 buttons              list title-bar boxes
+#   os99 buttons toggle NAME  close | zoom | collapse | shade | float | pin | full | kill
+#   os99 min                  park the active window
+#   os99 min list|restore|restore-all
+#   os99 uninstall
 set -uo pipefail
 
 _os99_lib="$(dirname -- "$(readlink -f "$0")")/os99-lib.sh"
 # shellcheck source=os99-lib.sh
 source "$_os99_lib" || { echo "os99: missing $_os99_lib" >&2; exit 1; }
 
-os99_use_hyprland || true
+OS99_VERSION="2.0.0"
+HYPR_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+TOML="$HYPR_DIR/os99-theme.toml"
+SNIPPET="$HYPR_DIR/os99.lua"
+BIN_LINK="$HOME/.local/bin/os99"
+LIBDIR="$HOME/.local/lib"
+PTR="$LIBDIR/libhyprbars-os99.path"
+BUILT="$LIBDIR/libhyprbars-os99.built"
+ART=$(os99_art_dir)
+MIN_WS=${OS99_MINIMIZE_WS:-os99-minimized}
 
-MINIMIZE=$(os99_sibling os99-minimize)
-BUTTONS=$(os99_sibling os99-buttons)
-INSTALL=$(os99_sibling os99-install)
-
-# gum is Omarchy's own prompt toolkit and is always present there. Without it
-# the same choices are offered as a numbered list, so this works over ssh on a
-# machine that has never heard of Omarchy.
-# gum needs a terminal of its own -- without one it fails with a bubbletea TTY
-# error rather than falling back. So a missing TTY counts the same as a missing
-# gum, which also makes `os99` usable down a pipe.
-have_gum() { command -v gum >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; }
-
-say()  { printf '  %s\n' "$*"; }
+die() { echo "os99: $*" >&2; exit 1; }
+say() { printf '  %s\n' "$*"; }
 head_() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
-# Present a list and answer with the chosen line. Arguments are the choices.
-choose() {
-  local header=$1; shift
-  (( $# )) || return 1
-  if have_gum; then
-    printf '%s\n' "$@" | gum choose --header="$header" || return 1
+usage() {
+  sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \?//'
+}
+
+# ------------------------------------------------------------------ rebuild
+
+cmd_rebuild() {
+  local src hyprbin hash new missing
+  src=$(os99_plugin_src) || die "cannot find plugin/hyprbars (run from the checkout)"
+  command -v pkg-config >/dev/null || die "pkg-config not found"
+  pkg-config --exists hyprland || die "hyprland headers not found (pkg-config hyprland)"
+  command -v make >/dev/null || die "make not found"
+  command -v "${CXX:-g++}" >/dev/null || die "a C++ compiler is not on PATH"
+
+  echo "Hyprland:    $(hyprctl version 2>/dev/null | head -1 || echo 'not running')"
+  echo "headers:     $(pkg-config --modversion hyprland)"
+  echo "source:      $src"
+
+  (
+    set -e
+    cd "$src"
+    make clean >/dev/null
+    make -j"$(nproc)" all
+  ) || die "plugin build failed"
+
+  # Hashed filename: Hyprland does not fully dlclose, so reusing a path loads
+  # the stale plugin. Never unlink an old .so while Hyprland still has it mapped.
+  _norm() { awk '{print $NF}' | sed 's/@.*//' | sort -u; }
+  hyprbin=""
+  if [[ -z ${HYPRBIN:-} ]]; then
+    local pid exe
+    for pid in $(pgrep -x Hyprland 2>/dev/null); do
+      exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
+      [[ -x $exe ]] && { hyprbin=$exe; break; }
+    done
   else
-    local i=1 line
-    printf '\n%s\n' "$header" >&2
-    for line in "$@"; do printf '  %2d) %s\n' "$i" "$line" >&2; i=$((i+1)); done
-    printf '  choice (empty to go back): ' >&2
-    read -r line || return 1
-    [[ -n $line && $line =~ ^[0-9]+$ && $line -ge 1 && $line -le $# ]] || return 1
-    printf '%s\n' "${!line}"
+    hyprbin=$HYPRBIN
+  fi
+  [[ -n $hyprbin ]] || hyprbin=$(command -v Hyprland 2>/dev/null || true)
+
+  if [[ -n $hyprbin ]]; then
+    echo "verifying symbols..."
+    missing=$(comm -23 \
+      <(nm -D --undefined-only "$src/hyprbars.so" | _norm) \
+      <({ nm -D --defined-only "$hyprbin" 2>/dev/null
+          ldd "$hyprbin" 2>/dev/null | awk '/=>/{print $3}' | xargs -r -n1 nm -D --defined-only 2>/dev/null
+          ldd "$src/hyprbars.so" 2>/dev/null | awk '/=>/{print $3}' | xargs -r -n1 nm -D --defined-only 2>/dev/null
+        } | _norm) \
+      | grep -vE '^(__gmon_start__|_ITM_(de)?registerTMCloneTable)$' || true)
+    if [[ -n $missing ]]; then
+      echo "os99: refusing to install — unresolved symbols:" >&2
+      printf '%s\n' "$missing" | head -10 | c++filt | sed 's/^/  /' >&2
+      exit 1
+    fi
+  fi
+
+  hash=$(sha256sum "$src/hyprbars.so" | cut -c1-12)
+  new="$LIBDIR/libhyprbars-os99-$hash.so"
+  mkdir -p "$LIBDIR"
+
+  if hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
+    local old
+    while read -r old; do
+      [[ -n $old ]] || continue
+      hyprctl plugin unload "$old" >/dev/null 2>&1 || true
+    done < <(os99_hyprbars_paths)
+    sleep 0.4
+  fi
+
+  install -m755 "$src/hyprbars.so" "$new.tmp"
+  mv -f "$new.tmp" "$new"
+  echo "$new" > "$PTR"
+  {
+    echo "SO=$new"
+    echo "HYPRLAND_ABI=$(os99_hypr_abi || true)"
+    echo "HYPRLAND_TAG=$(hyprctl version 2>/dev/null | sed -n 's/^Tag: \([^,]*\).*/\1/p' | head -1)"
+    echo "BUILT_AT=$(date -Is)"
+  } > "$BUILT.tmp" && mv -f "$BUILT.tmp" "$BUILT"
+  echo "installed $new"
+
+  if hyprctl version >/dev/null 2>&1; then
+    if [[ $(os99_loaded_so 2>/dev/null) != "$new" ]]; then
+      hyprctl plugin load "$new" >/dev/null 2>&1 || true
+    fi
+    if [[ $(os99_loaded_so 2>/dev/null) == "$new" ]]; then
+      echo "loaded"
+    else
+      echo "os99: plugin did not load. If you just upgraded Hyprland, log out and run ./install again." >&2
+      return 1
+    fi
   fi
 }
 
-confirm() {
-  if have_gum; then gum confirm "$1"
-  else
-    local a; printf '%s [y/N] ' "$1" >&2; read -r a; [[ ${a,,} == y* ]]
-  fi
+need_rebuild() {
+  local so src
+  so=$(os99_newest_so 2>/dev/null) || return 0
+  src=$(os99_plugin_src) || return 0
+  os99_abi_stale >/dev/null 2>&1 && return 0
+  local f
+  for f in "$src"/*.cpp "$src"/*.hpp "$src"/Makefile; do
+    [[ -f $f && $f -nt $so ]] && return 0
+  done
+  return 1
 }
 
-# ------------------------------------------------------------------- windows
+# -------------------------------------------------------------------- art
 
-windows_lines() {
-  # N, address, class, title -> "N  title (class)". The address is kept in a
-  # parallel array so a title can hold anything at all without being parsed.
-  ADDRS=(); LINES=()
-  local n addr class title
-  while IFS=$'\t' read -r n addr class title; do
-    [[ -n $addr ]] || continue
-    ADDRS+=("$addr")
-    LINES+=("$(printf '%-2s %s  (%s)' "$n" "${title:-$class}" "$class")")
-  done < <("$MINIMIZE" list 2>/dev/null)
+draw_art() {
+  local root gen
+  root=$(os99_root) || die "cannot find the OS 99 checkout"
+  gen="$root/decor/generate-art.py"
+  [[ -f $gen ]] || die "missing $gen"
+  python3 "$gen" --out "$ART" "$@"
 }
 
-cmd_windows() {
-  [[ -n $MINIMIZE ]] || { say "os99-minimize is not installed"; return 1; }
-  windows_lines
-  if (( ${#LINES[@]} == 0 )); then
-    head_ "Minimized windows"
-    say "Nothing is parked."
-    say "The collapse box on a title bar puts a window here."
-    return 0
+art_stale() {
+  local env_file="$ART/bar.env" want have
+  [[ -f $ART/bars.lua && -r $env_file ]] || return 0
+  command -v python3 >/dev/null || return 1
+  want=$(python3 - "$TOML" <<'PY' 2>/dev/null
+import json, os, subprocess, sys, tomllib
+cfg = {}
+p = sys.argv[1]
+if os.path.isfile(p):
+    cfg = tomllib.load(open(p, "rb"))
+s = cfg.get("display", {}).get("scale", "auto")
+if isinstance(s, str) and s.strip().lower() == "auto":
+    try:
+        mons = json.loads(subprocess.run(
+            ["hyprctl", "monitors", "-j"], capture_output=True, text=True,
+            timeout=5, check=True).stdout)
+        f = next((m for m in mons if m.get("focused")), mons[0])
+        s = float(f.get("scale", 1))
+    except Exception:
+        raise SystemExit(1)
+print(round(float(s), 6))
+PY
+)
+  [[ -n $want ]] || return 1
+  have=$(sed -n 's/^OS99_ART_SCALE=//p' "$env_file" | tail -1)
+  [[ -n $have ]] || return 0
+  python3 -c "import sys; sys.exit(0 if abs(float(sys.argv[1])-float(sys.argv[2]))<1e-6 else 1)" \
+    "$have" "$want" 2>/dev/null && return 1
+  return 0
+}
+
+# ------------------------------------------------------------------- apply
+
+cmd_apply() {
+  os99_use_hyprland || true
+  [[ -f $HYPR_DIR/os99-no-bars ]] && return 0
+  command -v hyprctl >/dev/null || return 0
+
+  if [[ ! -d $ART ]]; then
+    echo "os99: no art at $ART — run ./install" >&2
+    return 1
   fi
-  local pick idx
-  pick=$(choose "Minimized windows -- choose one to bring back" \
-                "${LINES[@]}" "restore them all") || return 0
-  if [[ $pick == "restore them all" ]]; then
-    "$MINIMIZE" restore-all && say "restored them all"
-    return 0
+  art_stale && draw_art --quiet
+
+  local so
+  so=$(os99_newest_so) || {
+    echo "os99: plugin not built — run ./install" >&2
+    return 1
+  }
+  if ! hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
+    hyprctl plugin load "$so" >/dev/null 2>&1 || true
+    sleep 0.3
   fi
-  for idx in "${!LINES[@]}"; do
-    [[ ${LINES[idx]} == "$pick" ]] || continue
-    "$MINIMIZE" restore "${ADDRS[idx]}" && say "restored ${ADDRS[idx]}"
-    return 0
+  if ! hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
+    if os99_abi_stale >/dev/null; then
+      echo "os99: Hyprland was updated. Run ./install to rebuild the frames." >&2
+    else
+      echo "os99: frame plugin did not load. Run ./install." >&2
+    fi
+    return 1
+  fi
+  [[ -r $ART/bars.lua ]] || return 1
+  hyprctl eval "os99_dir = '$ART'; dofile('$ART/bars.lua')" >/dev/null 2>&1
+}
+
+cmd_reload() {
+  os99_use_hyprland || true
+  draw_art
+  cmd_apply
+}
+
+# ----------------------------------------------------------------- install
+
+write_snippet() {
+  mkdir -p "$HYPR_DIR"
+  cat > "$SNIPPET" <<EOF
+-- OS 99 Platinum. Written by os99 install.
+os99_dir = "$ART"
+pcall(dofile, os99_dir .. "/bars.lua")
+pcall(function() hl.exec_cmd("$BIN_LINK apply") end)
+EOF
+}
+
+hook_lua() {
+  local f="$HYPR_DIR/hyprland.lua" block
+  [[ -f $f ]] || return 1
+  grep -q "os99 begin" "$f" 2>/dev/null && return 0
+  [[ -w $f ]] || return 1
+  block=$'\n-- os99 begin\npcall(dofile, "'"$SNIPPET"'")\n-- os99 end\n'
+  printf '%s' "$block" >> "$f"
+  return 0
+}
+
+hook_conf() {
+  local f="$HYPR_DIR/hyprland.conf" block
+  [[ -f $f ]] || return 1
+  grep -q "os99 begin" "$f" 2>/dev/null && return 0
+  [[ -w $f ]] || return 1
+  block=$'\n# os99 begin\nexec = '"$BIN_LINK"$' apply\n# os99 end\n'
+  printf '%s' "$block" >> "$f"
+  return 0
+}
+
+unhook() {
+  local f
+  for f in "$HYPR_DIR/hyprland.lua" "$HYPR_DIR/hyprland.conf"; do
+    [[ -f $f && -w $f ]] || continue
+    python3 - "$f" <<'PY'
+import re, sys
+p = sys.argv[1]
+text = open(p).read()
+text2 = re.sub(r"\n?(?:--|#) os99 begin\n.*?(?:--|#) os99 end\n?", "\n", text, count=1, flags=re.S)
+if text2 != text:
+    open(p, "w").write(text2)
+PY
   done
 }
 
-# --------------------------------------------------------------------- boxes
+cmd_install() {
+  local root
+  root=$(os99_root) || die "run ./install from the os-99 checkout"
+  os99_use_hyprland || true
 
-cmd_boxes() {
-  [[ -n $BUTTONS ]] || { say "os99-buttons is not installed"; return 1; }
-  # The id is kept in a parallel array rather than read back out of the line.
-  # Reading it back is how the first version broke: an off box renders as
-  # "[ ] pin", the space inside the marker splits into its own field, and the
-  # id came back as "]".
-  local rows=() ids=() state id label pick idx
-  while read -r state id _side label; do
-    [[ -n $id ]] || continue
-    ids+=("$id")
-    rows+=("$(printf '%s %-9s %s' "$([[ $state == on ]] && echo '[on] ' || echo '[off]')" "$id" "$label")")
-  done < <("$BUTTONS" list 2>/dev/null)
-  (( ${#rows[@]} )) || { say "could not read the box configuration"; return 1; }
-  pick=$(choose "Title bar boxes -- choose one to turn on or off" "${rows[@]}") || return 0
-  for idx in "${!rows[@]}"; do
-    [[ ${rows[idx]} == "$pick" ]] || continue
-    "$BUTTONS" toggle "${ids[idx]}"
-    return
-  done
+  head_ "OS 99 $OS99_VERSION"
+
+  command -v python3 >/dev/null || die "python3 not found"
+  python3 -c "import tomllib" 2>/dev/null || die "python3 >= 3.11 required (tomllib)"
+  command -v hyprctl >/dev/null || say "note: hyprctl not on PATH (ok if Hyprland is not running yet)"
+  pkg-config --exists hyprland 2>/dev/null || die "hyprland headers missing — install your distro's hyprland package (the one that ships /usr/include/hyprland)"
+
+  mkdir -p "$HYPR_DIR" "$HOME/.local/bin" "$(os99_state_dir)" "$(dirname "$ART")"
+  printf '%s\n' "$root" > "$(os99_state_dir)/source"
+
+  if [[ ! -f $TOML ]]; then
+    cp -f "$root/os99-theme.toml" "$TOML"
+    say "wrote $TOML"
+  else
+    say "keeping $TOML"
+  fi
+
+  ln -sfn "$root/bin/os99" "$BIN_LINK"
+  say "linked $BIN_LINK"
+
+  if need_rebuild; then
+    head_ "Building window frames"
+    cmd_rebuild
+  else
+    say "plugin already built for this Hyprland"
+  fi
+
+  head_ "Drawing Platinum art"
+  draw_art
+
+  write_snippet
+  if hook_conf; then
+    say "hooked $HYPR_DIR/hyprland.conf"
+  elif hook_lua; then
+    say "hooked $HYPR_DIR/hyprland.lua"
+  else
+    say "add this to your Hyprland config:"
+    say "  pcall(dofile, \"$SNIPPET\")     -- lua"
+    say "  exec = $BIN_LINK apply          -- hyprland.conf"
+  fi
+
+  if hyprctl version >/dev/null 2>&1; then
+    cmd_apply && say "frames loaded"
+  else
+    say "Hyprland is not running. Frames will load on next login."
+  fi
+
+  head_ "Done"
+  say "edit $TOML   then: os99 reload"
+  say "after git pull or a Hyprland update:  ./install"
 }
 
-# -------------------------------------------------------------------- status
+# ------------------------------------------------------------------ status
 
 cmd_status() {
-  [[ -n $INSTALL ]] || { say "os99-install is not installed"; return 1; }
-  local json
-  json=$("$INSTALL" --status 2>/dev/null) || { say "could not read the status"; return 1; }
-  head_ "OS 99"
-  python3 - "$json" <<'PYEOF'
-import json, sys
-d = json.loads(sys.argv[1])
-for s in d.get("steps", []):
-    print("  %s %s" % ("[x]" if s["done"] else "[ ]", s["label"]))
-    if not s["done"] and not s["fixable"] and s.get("hint"):
-        print("      %s" % s["hint"])
-if d.get("interrupted"):
-    print("\n  A previous run did not finish. Your theme before it was %s."
-          % d["interrupted"].get("themeBefore", "unknown"))
-if not d.get("ready"):
-    print("\n  %s" % (d.get("headline") or "Something is outstanding."))
-# Printed even when everything passes, because that is exactly when it matters:
-# nothing is wrong yet.
-if d.get("warning"):
-    print("\n  !! %s" % d["warning"])
-PYEOF
-  python3 -c "import json,sys; sys.exit(0 if json.loads(sys.argv[1])['ready'] else 1)" "$json" && return 0
-  confirm "Finish setting up OS 99 now?" || return 0
-  "$INSTALL" --auto
+  os99_use_hyprland || true
+  echo "OS 99 $OS99_VERSION"
+  echo "config   ${TOML}$([[ -f $TOML ]] && echo '' || echo '  (missing)')"
+  echo "art      $ART$([[ -f $ART/bars.lua ]] && echo '' || echo '  (missing)')"
+  echo "plugin   $(os99_newest_so 2>/dev/null || echo 'not built')"
+  if hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
+    echo "loaded   $(os99_loaded_so 2>/dev/null || echo yes)"
+  else
+    echo "loaded   no"
+  fi
+  if drift=$(os99_abi_stale); then
+    echo "ABI      stale — run ./install"
+  else
+    echo "ABI      $(os99_hypr_abi 2>/dev/null || echo unknown)"
+  fi
 }
 
-# ---------------------------------------------------------------------- menu
+# ----------------------------------------------------------------- buttons
 
-menu() {
-  local parked=0 pick
-  [[ -n $MINIMIZE ]] && parked=$("$MINIMIZE" count 2>/dev/null | tr -dc '0-9')
-  while :; do
-    pick=$(choose "OS 99" \
-      "Minimized windows${parked:+ ($parked parked)}" \
-      "Title bar boxes" \
-      "Status and setup" \
-      "Quit") || return 0
-    case $pick in
-      Minimized*) cmd_windows ;;
-      Title*)     cmd_boxes ;;
-      Status*)    cmd_status ;;
-      Quit|"")    return 0 ;;
-    esac
-    [[ -n $MINIMIZE ]] && parked=$("$MINIMIZE" count 2>/dev/null | tr -dc '0-9')
-  done
+cmd_buttons() {
+  local cfg cmd=${1:-list}
+  cfg=$(os99_config) || die "no os99-theme.toml — run ./install"
+  case $cmd in
+    list|"")
+      python3 - "$cfg" <<'PY'
+import os, sys, tomllib
+GLYPHS = ("close", "zoom", "collapse", "shade", "float", "pin", "full", "kill")
+LABELS = {"close":"Close","zoom":"Zoom","collapse":"Collapse","shade":"Windowshade",
+          "float":"Float","pin":"Pin","full":"Fullscreen","kill":"Force Quit"}
+HOME = {g: ("left" if g in ("close","kill") else "right") for g in GLYPHS}
+cfg = tomllib.load(open(os.path.realpath(sys.argv[1]), "rb"))
+b = cfg.get("buttons", {})
+left, right = list(b.get("left", ["close"])), list(b.get("right", ["zoom","collapse"]))
+for g in GLYPHS:
+    on = g in left or g in right
+    side = "left" if g in left else ("right" if g in right else HOME[g])
+    print(f"{'on ' if on else 'off'}  {g:<9} {side:<6} {LABELS[g]}")
+PY
+      ;;
+    toggle)
+      [[ -n ${2:-} ]] || die "usage: os99 buttons toggle <box>"
+      local new rc state
+      new=$(python3 - "$cfg" "$2" <<'PY'
+import os, re, sys, tomllib
+GLYPHS = ("close", "zoom", "collapse", "shade", "float", "pin", "full", "kill")
+HOME = {g: ("left" if g in ("close","kill") else "right") for g in GLYPHS}
+path, g = os.path.realpath(sys.argv[1]), sys.argv[2]
+if g not in GLYPHS:
+    sys.exit(f"no such box {g!r} — one of: {', '.join(GLYPHS)}")
+text = open(path).read()
+cfg = tomllib.loads(text)
+b = cfg.get("buttons", {})
+left, right = list(b.get("left", ["close"])), list(b.get("right", ["zoom","collapse"]))
+if g in left or g in right:
+    left = [x for x in left if x != g]
+    right = [x for x in right if x != g]
+    state = "off"
+else:
+    lst = left if HOME[g] == "left" else right
+    order = [x for x in GLYPHS if HOME[x] == HOME[g]]
+    lst.append(g)
+    lst.sort(key=order.index)
+    state = "on"
+
+def fmt(lst):
+    return "[" + ", ".join(f'"{x}"' for x in lst) + "]"
+
+lines, out, in_btn = text.splitlines(keepends=True), [], False
+done = {"left": False, "right": False}
+for ln in lines:
+    stripped = ln.strip()
+    if stripped.startswith("["):
+        if in_btn:
+            for key in ("left", "right"):
+                if not done[key]:
+                    out.append(f"{key:<9} = {fmt(left if key == 'left' else right)}\n")
+        in_btn = stripped == "[buttons]"
+    if in_btn:
+        m = re.match(r"(\s*)(left|right)\s*=", ln)
+        if m:
+            key = m.group(2)
+            out.append(f"{m.group(1)}{key:<9} = {fmt(left if key == 'left' else right)}\n")
+            done[key] = True
+            continue
+    out.append(ln)
+if in_btn:
+    for key in ("left", "right"):
+        if not done[key]:
+            out.append(f"{key:<9} = {fmt(left if key == 'left' else right)}\n")
+if not any(l.strip() == "[buttons]" for l in lines):
+    out.append("\n[buttons]\n")
+    out.append(f"left      = {fmt(left)}\n")
+    out.append(f"right     = {fmt(right)}\n")
+sys.stdout.write("".join(out))
+raise SystemExit(0 if state == "on" else 10)
+PY
+); rc=$?
+      case $rc in 0) state=on ;; 10) state=off ;; *) exit 1 ;; esac
+      printf '%s\n' "$new" | os99_publish "$cfg" || die "could not write $cfg"
+      echo "$2 $state"
+      cmd_reload >/dev/null
+      ;;
+    *) die "usage: os99 buttons [list | toggle <box>]" ;;
+  esac
 }
 
-case "${1:-menu}" in
-  menu)    menu ;;
-  windows) cmd_windows ;;
-  boxes)   cmd_boxes ;;
-  status)  cmd_status ;;
-  -h|--help|help)
-    sed -n '2,8p' "$0" | sed 's/^# \?//' ;;
-  *) echo "os99: unknown command '$1' (windows | boxes | status)" >&2; exit 2 ;;
+# ---------------------------------------------------------------- minimize
+
+_on_window() {
+  local addr=$1 call=$2
+  [[ $addr =~ ^0x[0-9a-fA-F]+$ ]] || die "bad window address '$addr'"
+  hyprctl dispatch "(function()
+    for _, w in ipairs(hl.get_windows()) do
+      if w.address == \"$addr\" then return $call end
+    end
+    return hl.dsp.no_op()
+  end)()" >/dev/null
+}
+
+_ws_ref() { [[ $1 =~ ^[0-9]+$ ]] && echo "$1" || echo "name:$1"; }
+
+_minimized() {
+  hyprctl clients -j | WS="$MIN_WS" python3 -c '
+import json, os, sys
+ws = os.environ["WS"]
+try: clients = json.load(sys.stdin)
+except Exception: sys.exit(1)
+out = [c for c in clients if c.get("workspace", {}).get("name") == ws]
+out.sort(key=lambda c: c.get("focusHistoryID", 1 << 30))
+for c in out[:200]:
+    addr = str(c.get("address") or "")
+    if not addr.startswith("0x"):
+        continue
+    title = "".join(" " if ord(ch) < 0x20 else ch for ch in str(c.get("title") or c.get("class") or "window"))[:120]
+    klass = "".join(" " if ord(ch) < 0x20 else ch for ch in str(c.get("class") or ""))[:120]
+    print("\t".join([addr, klass, title]))
+'
+}
+
+cmd_min() {
+  command -v hyprctl >/dev/null || die "hyprctl not found"
+  os99_use_hyprland || die "Hyprland is not running"
+  [[ $MIN_WS =~ ^[A-Za-z0-9_-]+$ ]] || die "bad workspace name"
+  local sub=${1:-park}
+  case $sub in
+    park|"")
+      local addr
+      addr=$(hyprctl activewindow -j | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("address") or "")
+except Exception: print("")')
+      [[ -n $addr ]] || die "no active window"
+      _on_window "$addr" "hl.dsp.window.move({ window = w, workspace = \"$(_ws_ref "$MIN_WS")\", follow = false })"
+      ;;
+    list)
+      local n=0 addr class title
+      while IFS=$'\t' read -r addr class title; do
+        n=$((n+1))
+        printf '%d  %s  %s\n' "$n" "$class" "$title"
+      done < <(_minimized)
+      [[ $n -eq 0 ]] && echo "(none)"
+      ;;
+    restore)
+      local want=${2:-1} addr="" here
+      if [[ $want =~ ^0x[0-9a-fA-F]+$ ]]; then addr=$want
+      elif [[ $want =~ ^[0-9]+$ ]]; then addr=$(_minimized | sed -n "${want}p" | cut -f1)
+      else die "restore takes an index or a 0x address"; fi
+      [[ -n $addr ]] || die "nothing minimized"
+      here=$(hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+      _on_window "$addr" "hl.dsp.window.move({ window = w, workspace = \"$(_ws_ref "$here")\", follow = false })"
+      _on_window "$addr" "hl.dsp.focus({ window = w })"
+      ;;
+    restore-all)
+      local addr
+      while IFS=$'\t' read -r addr _ _; do
+        [[ -n $addr ]] && cmd_min restore "$addr"
+      done < <(_minimized)
+      ;;
+    *) die "usage: os99 min [list | restore | restore-all]" ;;
+  esac
+}
+
+# -------------------------------------------------------------- uninstall
+
+cmd_uninstall() {
+  os99_use_hyprland || true
+  unhook
+  if hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
+    local p
+    while read -r p; do
+      [[ -n $p ]] && hyprctl plugin unload "$p" >/dev/null 2>&1 || true
+    done < <(os99_hyprbars_paths)
+  fi
+  rm -f "$BIN_LINK" "$SNIPPET" "$PTR"
+  rm -rf "$(dirname "$ART")"
+  say "removed frames, art, and the Hyprland hook"
+  say "kept $TOML"
+  say "plugin .so files stay in $LIBDIR until you log out (Hyprland may still have them mapped)"
+}
+
+# ---------------------------------------------------------------- dispatch
+
+case "${1:-status}" in
+  install)   cmd_install ;;
+  apply)     cmd_apply ;;
+  reload)    cmd_reload ;;
+  rebuild)   cmd_rebuild ;;
+  status|"") cmd_status ;;
+  buttons)   shift || true; cmd_buttons "$@" ;;
+  min|minimize) shift || true; cmd_min "$@" ;;
+  uninstall|remove) cmd_uninstall ;;
+  -h|--help|help) usage ;;
+  --version|version) echo "$OS99_VERSION" ;;
+  *) usage >&2; exit 2 ;;
 esac

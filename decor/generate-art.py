@@ -24,64 +24,36 @@ def mix(a, b, t=0.5):
     reads as a dish rather than a trench."""
     return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3)) + (255,)
 
-# ---------------------------------------------------------------------------
-# Everything tunable lives in ~/.config/omarchy/os99-theme.toml so it can be
-# nudged by eye without touching this file. Run os9-theme-reload after editing.
-# ---------------------------------------------------------------------------
+# Tunables live in ~/.config/hypr/os99-theme.toml. Edit it, then: os99 reload
 import tomllib
 
-# WHERE THE CONFIG COMES FROM. A theme repo has to be self-contained -- someone
-# installing it has no ~/.config/omarchy/os99-theme.toml and never will unless a
-# separate installer put one there. So each theme ships its own copy next to the
-# generator, and the user's file, if it exists, wins over it. That way the theme
-# works on a bare machine and still respects local tuning on this one.
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_DATA = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 for _candidate in (os.environ.get("OS99_CONFIG"),
-                   os.path.expanduser("~/.config/omarchy/os99-theme.toml"),
-                   os.path.expanduser("~/.config/os99/os99-theme.toml"),
                    os.path.expanduser("~/.config/hypr/os99-theme.toml"),
+                   os.path.join(_HERE, "..", "os99-theme.toml"),
                    os.path.join(_HERE, "os99-theme.toml")):
     if _candidate and os.path.isfile(_candidate):
         CFG_PATH = _candidate
         break
 else:
-    sys.exit("no os99-theme.toml found (looked at $OS99_CONFIG, ~/.config/{omarchy,os99,hypr}/ and beside this script)")
+    sys.exit("no os99-theme.toml found (looked at $OS99_CONFIG, ~/.config/hypr/, and the repo)")
 with open(CFG_PATH, "rb") as fh:
     CFG = tomllib.load(fh)
 
-# --- where the art goes ------------------------------------------------------
-# With no arguments this writes all three themes, which is what you want while
-# tuning locally. --out/--palette write ONE decor directory, which is what the
-# theme-set hook uses: it regenerates the LIVE theme in place, so a theme
-# installed on its own still gets art matching that machine's display.
 import argparse
-_ap = argparse.ArgumentParser(description="Draw the OS 9 Platinum theme art.")
-_ap.add_argument("--out", metavar="DIR", help="write one decor directory instead of all three")
-_ap.add_argument("--palette", choices=("light", "dark"), default="light",
-                 help="which palette from the toml to draw with (only with --out)")
+_ap = argparse.ArgumentParser(description="Draw OS 99 Platinum window art.")
+_ap.add_argument("--out", metavar="DIR",
+                 default=os.environ.get("OS99_DIR") or os.path.join(_DATA, "os99", "decor"),
+                 help="directory to write PNGs and bars.lua into")
 _ap.add_argument("--quiet", action="store_true")
 ARGS = _ap.parse_args()
 
 _bar, _frame = CFG["bar"], CFG["frame"]
 _btn, _txt   = CFG["buttons"], CFG["text"]
 
-# --- validate anything that reaches a shell or a Lua source ------------------
-# These values are interpolated into bar.env, which os99-window-bars SOURCES as
-# bash, and into bars.lua, which the compositor EXECUTES. A colour containing a
-# double quote therefore closes the string and injects:
-#
-#     face = 'D5D6D5"; rm -rf ~; #'
-#     -> OS99_FACE="rgb(D5D6D5"; rm -rf ~; #)"
-#
-# The toml is not always the user's own: each theme ships one in its decor
-# directory, so this is attacker-supplied for anyone installing a third-party
-# OS 99 theme. That is admittedly a boundary already crossed -- a theme's
-# hyprland.lua is executed too -- but a colour field is not where anyone expects
-# code, and the check costs nothing.
-#
-# VALIDATE rather than escape. Escaping would faithfully pass through a
-# malformed colour and produce baffling art; refusing names the mistake, which
-# is also what a typo deserves.
+# Colours and the font name are interpolated into bars.lua. Refuse anything
+# that could close a Lua string rather than try to escape it.
 import re
 
 _HEX = re.compile(r"^[0-9A-Fa-f]{6}$")
@@ -90,10 +62,9 @@ def _bad(where, value, why):
     sys.exit(f"os99-theme.toml: {where} = {value!r} {why}\n"
              f"  Read from {CFG_PATH}")
 
-for _pal in ("light", "dark"):
-    for _key, _val in (CFG.get(_pal) or {}).items():
-        if not isinstance(_val, str) or not _HEX.match(_val):
-            _bad(f"[{_pal}] {_key}", _val, "is not a 6-digit hex colour like \"D5D6D5\"")
+for _key, _val in (CFG.get("light") or {}).items():
+    if not isinstance(_val, str) or not _HEX.match(_val):
+        _bad(f"[light] {_key}", _val, "is not a 6-digit hex colour like \"D5D6D5\"")
 
 if _bar.get("clear_color") and not _HEX.match(str(_bar["clear_color"])):
     _bad("[bar] clear_color", _bar["clear_color"], "is not a 6-digit hex colour")
@@ -537,9 +508,8 @@ def titlebar(active, W=64, H=BAR_H):
     return p, W, H
 
 
-# Every box the title bar can carry. The art for ALL of them is emitted every
-# run -- the whole set is a few KB -- so toggling a box on later (os99-buttons,
-# or the right-click menu) never has to wait on a redraw.
+# Every box the title bar can carry. All of them are drawn every run so
+# `os99 buttons toggle` never waits on a redraw.
 GLYPHS = ("close", "zoom", "collapse", "shade", "float", "pin", "full", "kill")
 
 # What each box DOES, as the fork's native dispatchers (barDeco.cpp,
@@ -619,7 +589,7 @@ BTN_LUA = "\n".join(
     f'  add("/bar_{_g}.png", "{_side}", "{DISPATCH[_g]}",\n'
     f'      "{TOOLTIP[_g][0]}", "{TOOLTIP[_g][1]}", "{ACTIVE_WHEN.get(_g, "")}", "{SHOW_WHEN.get(_g, "")}")'
     for _side, _lst in (("left", BTN_LEFT), ("right", BTN_RIGHT))
-    for _g in _lst) or "  -- no boxes configured; os99-buttons or the menu can add them back"
+    for _g in _lst) or "  -- no boxes; `os99 buttons toggle close` adds them back"
 
 
 def box(kind, pressed, S=13):
@@ -798,27 +768,7 @@ def box(kind, pressed, S=13):
     return p, S
 
 
-# "noir" is a third Appearance: light chrome, dark documents. Its chrome is the
-# LIGHT palette verbatim -- only what lives inside a window changes, and that is
-# colors.toml's business, not this file's.
-if ARGS.out:
-    TARGETS = [(ARGS.palette, ARGS.out)]
-else:
-    # No-argument mode is a DEVELOPMENT convenience: draw all three Omarchy
-    # themes at once while tuning the toml. It is not the general entry point --
-    # on a machine without Omarchy those directories do not exist, and silently
-    # creating them would leave a confusing mess nobody asked for. --out is the
-    # portable way in, and is what the hook uses.
-    _themes = os.path.expanduser("~/.config/omarchy/themes")
-    if not os.path.isdir(_themes):
-        sys.exit("no Omarchy themes directory found.\n"
-                 "  This no-argument mode only exists to redraw the three bundled\n"
-                 "  Omarchy themes while tuning. To draw the art anywhere else:\n"
-                 "      generate-art.py --out <dir> --palette light|dark")
-    TARGETS = [(pal, os.path.join(_themes, theme, "decor"))
-               for pal, theme in (("light", "os-99-platinum"),
-                                  ("dark",  "os-99-graphite"),
-                                  ("light", "os-99-noir"))]
+TARGETS = [("light", ARGS.out)]
 
 for pal, d in TARGETS:
     use(pal)
@@ -849,11 +799,7 @@ for pal, d in TARGETS:
     # One source of truth: the hook sources this instead of hardcoding numbers
     # that would silently drift out of step with the art.
     with open(f"{d}/bar.env", "w") as fh:
-        fh.write(f"""# Generated by generate-art.py from ~/.config/omarchy/os99-theme.toml
-# Do not edit -- edit the toml and run os9-theme-reload.
-# The hook compares this against the live display and redraws on a mismatch.
-# Without it, art baked on the author's machine silently renders at the wrong
-# SIZE on anyone else's, because it is blitted 1:1.
+        fh.write(f"""# Generated from os99-theme.toml. Do not edit; run: os99 reload
 OS99_ART_SCALE={SCALE}
 OS99_ART_PALETTE={pal}
 OS99_BAR_HEIGHT={BAR_LOGICAL}
@@ -876,41 +822,19 @@ OS99_TEXT_COLOR="rgb({TEXTCOL})"
 OS99_FRAME_BORDER="{TOP} {SIDE} {SIDE} {SIDE}"
 OS99_FRAME_INSET="{BAR_LOGICAL} {int(_frame["bezel"])} {int(_frame["bezel"])} {int(_frame["bezel"])}"
 """)
-    # ---------------------------------------------------------------------
-    # bars.lua -- the SAME settings as bar.env, but as Hyprland config, written
-    # into the theme so that a config reload applies them directly.
-    #
-    # Why this exists: omarchy-theme-set runs `hyprctl reload` inside a parallel
-    # batch and only calls the theme-set hook AFTER every command in that batch
-    # finishes. One of them, omarchy-theme-set-tmux, takes ~19s on a machine
-    # with a lot of saved sessions. A reload resets plugin config to defaults,
-    # so if the frame is only restored by the hook, the title bar sits wrong for
-    # as long as the slowest unrelated command takes.
-    #
-    # The theme directory is swapped BEFORE that batch runs, so a reload that
-    # sources this file gets the NEW theme's colours immediately and never waits
-    # on tmux, or on anything else in the batch.
-    #
-    # Paths come from the `os99_dir` global the caller sets, because the art is
-    # read from wherever the theme is installed, not from where it was drawn.
+    # bars.lua is sourced on every Hyprland config load. hyprctl eval is wiped
+    # on reload, so the settings have to live in a file the config chain reads.
     with open(f"{d}/bars.lua", "w") as fh:
         fh.write(f"""-- Generated by generate-art.py -- do not edit.
--- Expects the caller to set the global `os99_dir` to this directory.
+-- Caller must set global `os99_dir` to this directory.
 local D = os99_dir
 
--- Is the plugin actually loaded? Everything that makes this theme look like a
--- window frame comes from it, so when it is absent -- not installed yet, or
--- disabled via the os99-no-bars kill switch -- the compositor settings that
--- only make sense ALONGSIDE a frame must not be applied. Turning the border off
--- with no frame to replace it leaves windows with no edge at all.
 local have_plugin = false
 pcall(function() have_plugin = hl.plugin ~= nil and hl.plugin.hyprbars ~= nil end)
 
--- Compositor-level settings; no plugin required, so kept in their own pcall.
 pcall(function()
   hl.config({{
     general = {{ border_size = have_plugin and 0 or 1 }},
-    misc = {{ background_color = "rgb(54679B)" }},
     group = {{ groupbar = {{ font_family = "{FONT_FAMILY}", font_size = {TEXT_SIZE} }} }},
     decoration = {{
       shadow = {{ enabled = true, sharp = true, range = {_SH_RANGE}, render_power = 1,
@@ -920,23 +844,10 @@ pcall(function()
   }})
 end)
 
--- The plugin's own keys. These exist only once hyprbars is loaded.
---
--- GUARDED, not merely pcall'd. hl.config RECORDS an unknown key as a config
--- error before it raises, so a pcall catches the exception but still leaves
--- "unknown config key 'plugin.hyprbars.*'" on Hyprland's error overlay -- once
--- per key. On a cold start the config is parsed before the plugin loads, and
--- with the kill switch set it never loads at all, so that overlay would be
--- permanent. Skipping the block entirely is the only way to stay quiet.
---
--- Nothing is lost by skipping: os99-window-bars re-runs this same file through
--- `hyprctl eval` once the plugin IS loaded, and on a reload with the plugin
--- already up have_plugin is true and these apply immediately.
+-- Skip plugin keys until hyprbars is loaded: unknown keys land on Hyprland's
+-- error overlay even inside pcall. `os99 apply` evals this again after load.
 if have_plugin then
   hl.config({{ plugin = {{ hyprbars = {{
-    -- The plugin defaults to off, so a theme that says nothing about hyprbars
-    -- gets no title bars. This is the file that says otherwise, and only an
-    -- OS 99 theme's hyprland.lua sources it.
     enabled = true,
     bar_height = {BAR_LOGICAL},
     bar_color = "rgb({CFG[pal]["face"]})",
@@ -964,16 +875,7 @@ if have_plugin then
   }} }} }})
 end
 
--- The boxes. hyprbars clears its button list on every config reload and never
--- repopulates ones added through the Lua API, so they have to be redeclared
--- here or every reload empties the title bar. clear_buttons (a fork addition)
--- makes it idempotent.
---
--- WHICH boxes appear comes from [buttons] left/right in os99-theme.toml,
--- corner-first per side (buttons fill outward from their own edge). Toggle
--- them with `os99-buttons`, or right-click a title bar. The default is the
--- OS 9 trio: close alone on the LEFT, zoom then collapse on the RIGHT, zoom
--- first to keep the top-right corner it has held since System 7.
+-- hyprbars clears API-added buttons on reload; redeclare them here.
 if have_plugin then
   hl.plugin.hyprbars.clear_buttons()
   local box = {{ bg_color = "rgb({CFG[pal]["face"]})", fg_color = "rgb({TEXTCOL})", size = {BOX_LOGICAL}, icon = "" }}
@@ -1028,4 +930,4 @@ print(f"  shadow      right {_SH_RIGHT}px / bottom {_SH_BOTTOM}px,"
       + ("" if _SH_OK else "   <-- shadow_right/shadow_bottom must be >= 0"))
 print(f"  nine-patch  top {TOP} / side {SIDE} / bottom {SIDE}   art {W}x{H}")
 print(f"  boxes       left: {', '.join(BTN_LEFT) or '(none)'}   right: {', '.join(BTN_RIGHT) or '(none)'}"
-      f"   (all {len(GLYPHS)} drawn; toggle with os99-buttons)")
+      f"   (all {len(GLYPHS)} drawn; toggle with: os99 buttons)")
