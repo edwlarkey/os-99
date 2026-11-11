@@ -4,6 +4,10 @@
 #include <hyprland/src/helpers/math/Math.hpp>
 #include <string>
 
+namespace Render {
+    class CRenderContext;
+}
+
 // A nine-patch is sliced once at load time into nine separate textures. Slicing
 // up front avoids any custom-UV work at draw time: each cell is just a texture
 // rendered into its own box, and the renderer stretches it for us.
@@ -25,7 +29,7 @@ bool loadNinePatch(SNinePatch& out, const std::string& path, int t, int r, int b
 // and centre stretch to fill. `skipCentre` leaves the middle cell undrawn --
 // a window frame only wants its ring, and painting a full-window quad under a
 // translucent client would tint it.
-void renderNinePatch(const SNinePatch& patch, const CBox& box, float alpha, float scale, bool skipCentre = false);
+void renderNinePatch(Render::CRenderContext& ctx, const SNinePatch& patch, const CBox& box, float alpha, float scale, bool skipCentre = false);
 
 // Loads a plain PNG as one nearest-filtered texture. Returns nullptr if the
 // file is missing or unreadable. Must be called with a GL context current,

@@ -112,7 +112,7 @@ bool loadNinePatch(SNinePatch& out, const std::string& path, int t, int r, int b
     return true;
 }
 
-void renderNinePatch(const SNinePatch& patch, const CBox& box, float alpha, float scale, bool skipCentre) {
+void renderNinePatch(Render::CRenderContext& ctx, const SNinePatch& patch, const CBox& box, float alpha, float scale, bool skipCentre) {
     if (!patch.valid)
         return;
 
@@ -147,7 +147,7 @@ void renderNinePatch(const SNinePatch& patch, const CBox& box, float alpha, floa
             if (dst.w < 1 || dst.h < 1)
                 continue;
 
-            Render::GL::g_pHyprOpenGL->renderTexture(patch.cells[i], dst, {.a = alpha});
+            Render::GL::g_pHyprOpenGL->renderTexture(ctx, patch.cells[i], dst, {.a = alpha});
         }
     }
 }

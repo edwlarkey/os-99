@@ -7,7 +7,7 @@ endif
 
 CXXFLAGS ?= -O2
 CXXFLAGS += -shared -fPIC -std=c++2b -Wno-c++11-narrowing
-INCLUDES = `pkg-config --cflags pixman-1 libdrm hyprland libinput libudev wayland-server xkbcommon`
+INCLUDES = `pkg-config --cflags pixman-1 libdrm hyprland libinput libudev wayland-server xkbcommon cairo`
 LIBS =
 
 # GLOB, do not list. Upstream's Makefile named three files explicitly while its

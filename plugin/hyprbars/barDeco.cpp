@@ -22,9 +22,11 @@ static constexpr int CLAMP_ATTEMPTS     = 3;
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/state/LayerState.hpp>
 #include <hyprland/src/desktop/state/ViewHitTester.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/helpers/MiscFunctions.hpp>
+#include <hyprland/src/keybinds/Manager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/render/Renderer.hpp>
@@ -213,7 +215,7 @@ SDecorationPositioningInfo CHyprBar::getPositioningInfo() {
     info.edges          = DECORATION_EDGE_TOP;
     info.priority       = PRECEDENCE ? 10005 : 5000;
     info.reserved       = true;
-    info.desiredExtents = {{0, m_hidden || !ENABLED ? 0 : HEIGHT}, {0, 0}};
+    info.desiredExtents = {{0, sc<int>(m_hidden || !ENABLED ? 0 : HEIGHT)}, {0, 0}};
     return info;
 }
 
@@ -452,22 +454,16 @@ void CHyprBar::onMouseMove(Vector2D coords) {
 }
 
 void CHyprBar::onTouchMove(Event::SCallbackInfo& info, ITouch::SMotionEvent e) {
+    (void)info;
     if (!m_bDragPending || !m_bTouchEv || !validMapped(m_pWindow) || e.touchID != m_touchId)
         return;
 
-    auto PMONITOR     = m_pWindow->m_monitor.lock();
-    PMONITOR          = PMONITOR ? PMONITOR : Desktop::focusState()->monitor();
-    const auto COORDS = Vector2D(PMONITOR->m_position.x + e.pos.x * PMONITOR->m_size.x, PMONITOR->m_position.y + e.pos.y * PMONITOR->m_size.y);
-
     if (!m_bDraggingThis) {
-        // Initial setup for dragging a window.
-        g_pKeybindManager->m_dispatchers["setfloating"]("activewindow");
-        g_pKeybindManager->m_dispatchers["resizewindowpixel"]("exact 50% 50%,activewindow");
-        // pin it so you can change workspaces while dragging a window
-        g_pKeybindManager->m_dispatchers["pin"]("activewindow");
+        (void)Config::Actions::floatWindow(Config::Actions::eTogglableAction::TOGGLE_ACTION_ENABLE, m_pWindow.lock());
+        (void)Config::Actions::pinWindow(Config::Actions::eTogglableAction::TOGGLE_ACTION_ENABLE, m_pWindow.lock());
+        g_layoutManager->beginDragTarget(m_pWindow.lock()->layoutTarget(), MBIND_MOVE);
+        m_bDraggingThis = true;
     }
-    g_pKeybindManager->m_dispatchers["movewindowpixel"](std::format("exact {} {},activewindow", (int)(COORDS.x - (assignedBoxGlobal().w / 2)), (int)COORDS.y));
-    m_bDraggingThis = true;
 }
 
 void CHyprBar::handleDownEvent(Event::SCallbackInfo& info, std::optional<ITouch::SDownEvent> touchEvent) {
@@ -506,9 +502,9 @@ void CHyprBar::handleDownEvent(Event::SCallbackInfo& info, std::optional<ITouch:
 
         if (m_bDraggingThis) {
             if (m_bTouchEv)
-                g_pKeybindManager->m_dispatchers["settiled"]("activewindow");
-            g_pKeybindManager->m_dispatchers["mouse"]("0movewindow");
-            Log::logger->log(Log::DEBUG, "[hyprbars] Dragging ended on {:x}", (uintptr_t)PWINDOW.get());
+                (void)Config::Actions::floatWindow(Config::Actions::eTogglableAction::TOGGLE_ACTION_DISABLE);
+            g_layoutManager->endDragTarget();
+            LOG(Log::DEBUG, "[hyprbars] Dragging ended on {:x}", (uintptr_t)PWINDOW.get());
         }
 
         m_bDraggingThis = false;
@@ -520,7 +516,10 @@ void CHyprBar::handleDownEvent(Event::SCallbackInfo& info, std::optional<ITouch:
     if (Desktop::focusState()->window() != PWINDOW)
         Desktop::focusState()->fullWindowFocus(PWINDOW, Desktop::FOCUS_REASON_CLICK);
 
-    if (PWINDOW->m_isFloating)
+    if (PWINDOW->hasPopupAt(COORDS + assignedBoxGlobal().pos()))
+        return;
+
+    if (PWINDOW->isFloating())
         Desktop::windowState()->raise(PWINDOW);
 
     info.cancelled   = true;
@@ -549,12 +548,12 @@ void CHyprBar::handleUpEvent(Event::SCallbackInfo& info) {
     m_bCancelledDown = false;
 
     if (m_bDraggingThis) {
-        g_pKeybindManager->changeMouseBindMode(MBIND_INVALID);
+        g_layoutManager->endDragTarget();
         m_bDraggingThis = false;
         if (m_bTouchEv)
             (void)Config::Actions::floatWindow(Config::Actions::eTogglableAction::TOGGLE_ACTION_DISABLE);
 
-        Log::logger->log(Log::DEBUG, "[hyprbars] Dragging ended on {:x}", (uintptr_t)m_pWindow.lock().get());
+        LOG(Log::DEBUG, "[hyprbars] Dragging ended on {:x}", (uintptr_t)m_pWindow.lock().get());
     }
 
     m_bDragPending = false;
@@ -563,10 +562,9 @@ void CHyprBar::handleUpEvent(Event::SCallbackInfo& info) {
 }
 
 void CHyprBar::handleMovement() {
-    g_pKeybindManager->changeMouseBindMode(MBIND_MOVE);
+    g_layoutManager->beginDragTarget(m_pWindow.lock()->layoutTarget(), MBIND_MOVE);
     m_bDraggingThis = true;
-    Log::logger->log(Log::DEBUG, "[hyprbars] Dragging initiated on {:x}", (uintptr_t)m_pWindow.lock().get());
-    return;
+    LOG(Log::DEBUG, "[hyprbars] Dragging initiated on {:x}", (uintptr_t)m_pWindow.lock().get());
 }
 
 // The small set of actions a title-bar box can sensibly perform, called in
@@ -592,7 +590,7 @@ void CHyprBar::runNativeDispatch(const std::string& what) {
     // this whole change is fixing -- so say something.
     const auto REPORT = [&what](ActionResult r) {
         if (!r)
-            Log::logger->log(Log::ERR, "[hyprbars] button dispatch '{}' failed: {}", what, r.error().message);
+            LOG(Log::ERR, "[hyprbars] button dispatch '{}' failed: {}", what, r.error().message);
     };
 
     if (what == "close")
@@ -625,7 +623,7 @@ void CHyprBar::runNativeDispatch(const std::string& what) {
     else if (what == "minimize")
         minimizeWindow();
     else
-        Log::logger->log(Log::ERR, "[hyprbars] unknown button dispatch '{}'", what);
+        LOG(Log::ERR, "[hyprbars] unknown button dispatch '{}'", what);
 }
 
 // MINIMIZE: park the window on a workspace the user is not looking at.
@@ -680,7 +678,7 @@ void CHyprBar::minimizeWindow() {
 
     const auto REPLY = HyprlandAPI::invokeHyprctlCommand("dispatch", LUA);
     if (REPLY != "ok")
-        Log::logger->log(Log::ERR, "[hyprbars] minimize failed: {}", REPLY);
+        LOG(Log::ERR, "[hyprbars] minimize failed: {}", REPLY);
 }
 
 // WINDOWSHADE: roll the window up into just its title bar, and back down again.
@@ -713,13 +711,13 @@ void CHyprBar::toggleShade() {
 
     const auto REPORT = [](const char* what, ActionResult r) {
         if (!r)
-            Log::logger->log(Log::ERR, "[hyprbars] shade: {} failed: {}", what, r.error().message);
+            LOG(Log::ERR, "[hyprbars] shade: {} failed: {}", what, r.error().message);
     };
 
     if (!m_bShaded) {
         m_shadeRestoreSize = PWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
         m_shadeRestorePos  = PWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
-        m_bShadeWasTiled   = !PWINDOW->m_isFloating;
+        m_bShadeWasTiled   = !PWINDOW->isFloating();
 
         if (m_bShadeWasTiled)
             REPORT("float", floatWindow(TOGGLE_ACTION_ENABLE, PWINDOW));
@@ -768,7 +766,7 @@ bool CHyprBar::doButtonPress(Config::INTEGER barPadding, Config::INTEGER barButt
                 return true;
             }
 
-            g_pKeybindManager->m_dispatchers["exec"](BUTTON.cmd);
+            Config::Supplementary::executor()->spawn(BUTTON.cmd);
             return true;
         }
     }
@@ -921,10 +919,10 @@ bool CHyprBar::windowInState(const std::string& state) {
         return m_bShaded;
 
     if (state == "floating")
-        return PWINDOW->m_isFloating;
+        return PWINDOW->isFloating();
 
     if (state == "pinned")
-        return PWINDOW->m_pinned;
+        return bool(PWINDOW->m_state & Desktop::View::WINDOW_STATE_PINNED);
 
     const auto MODES = Fullscreen::controller()->getFullscreenModes(PWINDOW);
 
@@ -951,7 +949,7 @@ bool CHyprBar::buttonVisible(const SHyprButton& button) {
     return button.showWhen.empty() || windowInState(button.showWhen);
 }
 
-void CHyprBar::renderBarButtons(CBox* barBox, const float scale, const float a) {
+void CHyprBar::renderBarButtons(Render::CRenderContext& ctx, CBox* barBox, const float scale, const float a) {
     const auto INACTIVECOLOR   = g_pGlobalState->config.inactiveButtonColor->value();
     const bool INVALIDATEICONS = m_bButtonsDirty || m_bWindowSizeChanged;
 
@@ -994,7 +992,7 @@ void CHyprBar::renderBarButtons(CBox* barBox, const float scale, const float a) 
             }
 
             if (tex) {
-                g_pHyprOpenGL->renderTexture(tex, buttonBox, {.a = a});
+                g_pHyprOpenGL->renderTexture(ctx, tex, buttonBox, {.a = a});
                 continue;
             }
         }
@@ -1009,11 +1007,11 @@ void CHyprBar::renderBarButtons(CBox* barBox, const float scale, const float a) 
 
         color.a *= a;
 
-        g_pHyprOpenGL->renderRect(buttonBox, color, {.round = static_cast<int>(std::round(buttonBox.w / 2.0)), .roundingPower = 2.F});
+        g_pHyprOpenGL->renderRect(ctx, buttonBox, color, {.round = static_cast<int>(std::round(buttonBox.w / 2.0)), .roundingPower = 2.F});
     }
 }
 
-void CHyprBar::renderBarButtonsText(CBox* barBox, const float scale, const float a) {
+void CHyprBar::renderBarButtonsText(Render::CRenderContext& ctx, CBox* barBox, const float scale, const float a) {
     const auto HEIGHT      = g_pGlobalState->config.barHeight->value();
     const auto ICONONHOVER = g_pGlobalState->config.iconOnHover->value();
     const auto COORDS      = cursorRelativeToBar();
@@ -1074,7 +1072,7 @@ void CHyprBar::renderBarButtonsText(CBox* barBox, const float scale, const float
         CBox       pos   = {iconX, iconY, button.iconTex->m_size.x, button.iconTex->m_size.y};
 
         if (!ICONONHOVER || (ICONONHOVER && m_iButtonHoverState > 0))
-            g_pHyprOpenGL->renderTexture(button.iconTex, pos, {.a = a});
+            g_pHyprOpenGL->renderTexture(ctx, button.iconTex, pos, {.a = a});
 
         trackHover();
     }
@@ -1104,7 +1102,9 @@ void CHyprBar::onButtonHoverChanged(int index) {
     damageEntire();
 }
 
-void CHyprBar::draw(PHLMONITOR pMonitor, const float& a) {
+void CHyprBar::draw(Render::CRenderContext& ctx, PHLMONITOR pMonitor, const float& a, const Render::SWindowRenderPresentation& presentation) {
+    (void)pMonitor;
+    (void)presentation;
     if (barsShuttingDown())
         return;
 
@@ -1124,10 +1124,10 @@ void CHyprBar::draw(PHLMONITOR pMonitor, const float& a) {
         return;
 
     auto data = CBarPassElement::SBarData{this, a};
-    g_pHyprRenderer->m_renderPass.add(makeUnique<CBarPassElement>(data));
+    Render::IHyprRenderer::addPassElement(ctx, makeUnique<CBarPassElement>(data));
 }
 
-void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
+void CHyprBar::renderPass(Render::CRenderContext& ctx, PHLMONITOR pMonitor, const float& a) {
     // UNLOAD SAFETY. This runs inside Hyprland's render pass, and every line
     // below dereferences a config value owned by this plugin. When the plugin is
     // unloaded those values are destroyed, but a CBarPassElement can still be
@@ -1175,15 +1175,15 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     }
 
     const auto PWORKSPACE      = PWINDOW->m_workspace;
-    const auto WORKSPACEOFFSET = PWORKSPACE && !PWINDOW->m_pinned ? PWORKSPACE->m_renderOffset->value() : Vector2D();
+    const auto WORKSPACEOFFSET = PWORKSPACE && !(PWINDOW->m_state & Desktop::View::WINDOW_STATE_PINNED) ? PWORKSPACE->m_renderOffset->value() : Vector2D();
 
-    const auto ROUNDING = PWINDOW->rounding() + (PRECEDENCE ? 0 : PWINDOW->getRealBorderSize());
+    const auto ROUNDING = PWINDOW->presentation().rounding() + (PRECEDENCE ? 0 : PWINDOW->presentation().borderSize());
 
     const auto scaledRounding = ROUNDING > 0 ? ROUNDING * pMonitor->m_scale - 2 /* idk why but otherwise it looks bad due to the gaps */ : 0;
 
     const auto FRAME = frameMetrics();
 
-    m_seExtents = FRAME.on ? SBoxExtents{{(double)FRAME.left, (double)HEIGHT}, {(double)FRAME.right, (double)FRAME.bottom}} : SBoxExtents{{0, HEIGHT}, {}};
+    m_seExtents = FRAME.on ? SBoxExtents{{(double)FRAME.left, (double)HEIGHT}, {(double)FRAME.right, (double)FRAME.bottom}} : SBoxExtents{{0, sc<int>(HEIGHT)}, {}};
 
     const auto DECOBOX = assignedBoxGlobal();
 
@@ -1199,23 +1199,23 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     CBox       titleBarBox = {DECOBOX.x - pMonitor->m_position.x, DECOBOX.y - pMonitor->m_position.y, DECOBOX.w,
                               DECOBOX.h + ROUNDING * 3 /* to fill the bottom cuz we can't disable rounding there */};
 
-    titleBarBox.translate(PWINDOW->m_floatingOffset).scale(pMonitor->m_scale).round();
+    titleBarBox.translate(PWINDOW->presentation().floatingOffset()).scale(pMonitor->m_scale).round();
 
     if (titleBarBox.w < 1 || titleBarBox.h < 1)
         return;
 
     const auto FRAMEBOX_GLOBAL = frameBoxGlobal();
     CBox       frameBox        = {FRAMEBOX_GLOBAL.x - pMonitor->m_position.x, FRAMEBOX_GLOBAL.y - pMonitor->m_position.y, FRAMEBOX_GLOBAL.w, FRAMEBOX_GLOBAL.h};
-    frameBox.translate(PWINDOW->m_floatingOffset).scale(pMonitor->m_scale).round();
+    frameBox.translate(PWINDOW->presentation().floatingOffset()).scale(pMonitor->m_scale).round();
 
     // The bezel lives outside the bar strip, so the scissor has to open up to
     // the whole ring or the sides and bottom get clipped away.
-    g_pHyprOpenGL->scissor(FRAME.on ? frameBox : titleBarBox);
+    g_pHyprOpenGL->scissor(ctx, FRAME.on ? frameBox : titleBarBox);
 
     if (ROUNDING) {
         // the +1 is a shit garbage temp fix until renderRect supports an alpha matte
-        CBox windowBox = {PWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT).x + PWINDOW->m_floatingOffset.x - pMonitor->m_position.x + 1,
-                          PWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT).y + PWINDOW->m_floatingOffset.y - pMonitor->m_position.y + 1,
+        CBox windowBox = {PWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT).x + PWINDOW->presentation().floatingOffset().x - pMonitor->m_position.x + 1,
+                          PWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT).y + PWINDOW->presentation().floatingOffset().y - pMonitor->m_position.y + 1,
                           PWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT).x - 2, PWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT).y - 2};
 
         if (windowBox.w < 1 || windowBox.h < 1)
@@ -1232,7 +1232,7 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
 
         windowBox.translate(WORKSPACEOFFSET).scale(pMonitor->m_scale).round();
-        g_pHyprOpenGL->renderRect(windowBox, CHyprColor(0, 0, 0, 0), {.round = scaledRounding, .roundingPower = m_pWindow->roundingPower()});
+        g_pHyprOpenGL->renderRect(ctx, windowBox, CHyprColor(0, 0, 0, 0), {.round = sc<int>(scaledRounding), .roundingPower = m_pWindow->presentation().roundingPower()});
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
         glStencilFunc(GL_NOTEQUAL, 1, -1);
@@ -1262,7 +1262,7 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
 
             // Skip the centre cell: the client covers it, and painting it would
             // tint any window that is translucent.
-            renderNinePatch(PATCH, frameBox, a, PATCHSCALE, true);
+            renderNinePatch(ctx, PATCH, frameBox, a, PATCHSCALE, true);
             texturedBar = true;
         }
     }
@@ -1277,7 +1277,7 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
             const auto& PATCH   = (FOCUSED || !g_ninePatchInactive.valid) ? g_ninePatchActive : g_ninePatchInactive;
 
             if (PATCH.valid) {
-                renderNinePatch(PATCH, titleBarBox, a, pMonitor->m_scale);
+                renderNinePatch(ctx, PATCH, titleBarBox, a, pMonitor->m_scale);
                 texturedBar = true;
             }
         }
@@ -1287,14 +1287,15 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // load, so an unset/bad path degrades to upstream behaviour.
     if (!texturedBar) {
         if (SHOULDBLUR)
-            g_pHyprOpenGL->renderRect(titleBarBox, color, {.round = scaledRounding, .roundingPower = m_pWindow->roundingPower(), .blur = true, .blurA = a});
+            g_pHyprOpenGL->renderRect(ctx, titleBarBox, color, {.round = sc<int>(scaledRounding), .roundingPower = m_pWindow->presentation().roundingPower(), .blur = true, .blurA = a});
         else
-            g_pHyprOpenGL->renderRect(titleBarBox, color, {.round = scaledRounding, .roundingPower = m_pWindow->roundingPower()});
+            g_pHyprOpenGL->renderRect(ctx, titleBarBox, color, {.round = sc<int>(scaledRounding), .roundingPower = m_pWindow->presentation().roundingPower()});
     }
 
     // render title
-    if (ENABLETITLE && (m_szLastTitle != PWINDOW->m_title || m_bWindowSizeChanged || !m_pTextTex || m_pTextTex->m_texID == 0 || m_bTitleColorChanged)) {
-        m_szLastTitle = PWINDOW->m_title;
+    const auto TITLE = m_forcedTitle.value_or(PWINDOW->metadata().title());
+    if (ENABLETITLE && (m_szLastTitle != TITLE || m_bWindowSizeChanged || !m_pTextTex || m_pTextTex->m_texID == 0 || m_bTitleColorChanged)) {
+        m_szLastTitle = TITLE;
         renderBarTitle(BARBUF, pMonitor->m_scale);
     }
 
@@ -1307,7 +1308,7 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
         glStencilFunc(GL_ALWAYS, 1, 0xFF);
     }
 
-    CBox textBox = {titleBarBox.x, titleBarBox.y, (int)BARBUF.x, (int)BARBUF.y};
+    CBox textBox = {titleBarBox.x, titleBarBox.y, BARBUF.x, BARBUF.y};
 
     // A patterned bar (the OS 9 hatch) must not run behind the title or behind
     // the boxes -- on real Platinum the ridges stop dead at both. Painting the
@@ -1338,7 +1339,7 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
             CBox patch = {textBox.x + CENTRE - TEXTPAD, CLEAR_Y, WIDTH + TEXTPAD * 2, CLEAR_H};
             patch.round();
             if (patch.w > 0 && patch.h > 0)
-                g_pHyprOpenGL->renderRect(patch, clear, {});
+                g_pHyprOpenGL->renderRect(ctx, patch, clear, {});
         }
 
         bool clearedLeft = false, clearedRight = false;
@@ -1362,7 +1363,7 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
             CBox patch = {textBox.x + x0, CLEAR_Y, x1 - x0, CLEAR_H};
             patch.round();
             if (patch.w > 0 && patch.h > 0)
-                g_pHyprOpenGL->renderRect(patch, clear, {});
+                g_pHyprOpenGL->renderRect(ctx, patch, clear, {});
         }
     }
 
@@ -1378,19 +1379,19 @@ void CHyprBar::renderPass(PHLMONITOR pMonitor, const float& a) {
 
         CBox titleBox = {textBox.x + xOffset, textBox.y + yOffset, m_pTextTex->m_size.x, m_pTextTex->m_size.y};
 
-        g_pHyprOpenGL->renderTexture(m_pTextTex, titleBox, {.a = a});
+        g_pHyprOpenGL->renderTexture(ctx, m_pTextTex, titleBox, {.a = a});
     }
 
-    renderBarButtons(&textBox, pMonitor->m_scale, a);
+    renderBarButtons(ctx, &textBox, pMonitor->m_scale, a);
     m_bButtonsDirty = false;
 
-    g_pHyprOpenGL->scissor(nullptr);
+    g_pHyprOpenGL->scissor(ctx, nullptr);
 
-    renderBarButtonsText(&textBox, pMonitor->m_scale, a);
+    renderBarButtonsText(ctx, &textBox, pMonitor->m_scale, a);
 
     // Last, and only here: the scissor was dropped above, so this is the one
     // point in the pass where something may be drawn outside the frame.
-    renderTooltip(pMonitor, a);
+    renderTooltip(ctx, pMonitor, a);
 
     m_bWindowSizeChanged = false;
     m_bTitleColorChanged = false;
@@ -1429,7 +1430,7 @@ void CHyprBar::keepShadeOnScreen() {
         return;
 
     const auto PWINDOW = m_pWindow.lock();
-    if (!PWINDOW || !PWINDOW->m_isFloating)
+    if (!PWINDOW || !PWINDOW->isFloating())
         return; // still settling; does not count against the budget
 
     // GOAL, not CURRENT: moves animate, and reading the animation's present
@@ -1459,7 +1460,7 @@ void CHyprBar::keepShadeOnScreen() {
 
     ++m_shadeFixTries;
     if (!Config::Actions::move(DELTA, true, PWINDOW))
-        Log::logger->log(Log::ERR, "[hyprbars] shade: could not restore the bar's position");
+        LOG(Log::ERR, "[hyprbars] shade: could not restore the bar's position");
 }
 
 // No floating window's title bar may sit under the status bar. The status bar
@@ -1487,7 +1488,7 @@ void CHyprBar::keepBarBelowPanels() {
         return;
 
     const auto PWINDOW = m_pWindow.lock();
-    if (!PWINDOW || !validMapped(PWINDOW) || !PWINDOW->m_isFloating)
+    if (!PWINDOW || !validMapped(PWINDOW) || !PWINDOW->isFloating())
         return;
 
     if (m_hidden || !g_pGlobalState->config.enabled->value() || !PWINDOW->m_ruleApplicator->decorate().valueOrDefault())
@@ -1604,17 +1605,17 @@ void CHyprBar::damageEntire() {
 // has already been dropped (renderPass calls scissor(nullptr) before the button
 // text) -- everything earlier is clipped to the frame, and a tooltip has to
 // hang below it.
-void CHyprBar::renderTooltip(PHLMONITOR pMonitor, const float a) {
+void CHyprBar::renderTooltip(Render::CRenderContext& ctx, PHLMONITOR pMonitor, const float a) {
     // Belt and braces: this runs inside the render pass, where an escaping
     // exception is std::terminate and the session is gone. Everything it
     // touches -- config values, text rendering, textures -- is something that
     // has thrown here before.
     try {
-        renderTooltipInner(pMonitor, a);
+        renderTooltipInner(ctx, pMonitor, a);
     } catch (...) { /* a tooltip is never worth the session */ }
 }
 
-void CHyprBar::renderTooltipInner(PHLMONITOR pMonitor, const float a) {
+void CHyprBar::renderTooltipInner(Render::CRenderContext& ctx, PHLMONITOR pMonitor, const float a) {
     if (m_hoveredButton < 0 || m_hoveredButton >= (int)g_pGlobalState->buttons.size() || !g_pGlobalState->config.barTooltips->value())
         return;
 
@@ -1711,7 +1712,7 @@ void CHyprBar::renderTooltipInner(PHLMONITOR pMonitor, const float a) {
     m_lastTooltipBox = CBox{x, y, W, H};
 
     CBox box = {x - pMonitor->m_position.x, y - pMonitor->m_position.y, W, H};
-    box.translate(PWINDOW->m_floatingOffset).scale(SCALE).round();
+    box.translate(PWINDOW->presentation().floatingOffset()).scale(SCALE).round();
 
     auto face = configColor(g_pGlobalState->config.barClearColor->value());
     if (face.a <= 0.F)
@@ -1727,13 +1728,13 @@ void CHyprBar::renderTooltipInner(PHLMONITOR pMonitor, const float a) {
     // Platinum, so: a hard offset shadow with no blur at all, a 1px rule, and
     // a flat face. Blur is the giveaway that something is not classic Mac.
     const double OFF = std::round(2 * SCALE);
-    g_pHyprOpenGL->renderRect(CBox{box.x + OFF, box.y + OFF, box.w, box.h}, shadow, {});
-    g_pHyprOpenGL->renderRect(box, border, {});
-    g_pHyprOpenGL->renderRect(CBox{box.x + 1, box.y + 1, box.w - 2, box.h - 2}, face, {});
+    g_pHyprOpenGL->renderRect(ctx, CBox{box.x + OFF, box.y + OFF, box.w, box.h}, shadow, {});
+    g_pHyprOpenGL->renderRect(ctx, box, border, {});
+    g_pHyprOpenGL->renderRect(ctx, CBox{box.x + 1, box.y + 1, box.w - 2, box.h - 2}, face, {});
 
     CBox textBox = {box.x + std::round((box.w - m_tooltipTex->m_size.x) / 2.0), box.y + std::round((box.h - m_tooltipTex->m_size.y) / 2.0), m_tooltipTex->m_size.x,
                     m_tooltipTex->m_size.y};
-    g_pHyprOpenGL->renderTexture(m_tooltipTex, textBox, {.a = a});
+    g_pHyprOpenGL->renderTexture(ctx, m_tooltipTex, textBox, {.a = a});
 }
 
 Vector2D CHyprBar::cursorRelativeToBar() {
@@ -1765,7 +1766,7 @@ CBox CHyprBar::assignedBoxGlobal() {
         return {};
 
     const auto PWORKSPACE      = m_pWindow->m_workspace;
-    const auto WORKSPACEOFFSET = PWORKSPACE && !m_pWindow->m_pinned ? PWORKSPACE->m_renderOffset->value() : Vector2D();
+    const auto WORKSPACEOFFSET = PWORKSPACE && !(m_pWindow->m_state & Desktop::View::WINDOW_STATE_PINNED) ? PWORKSPACE->m_renderOffset->value() : Vector2D();
     const auto FRAME           = frameMetrics();
 
     // The contract of this box is "the title bar strip", and every hit test,
@@ -1805,6 +1806,11 @@ CBox CHyprBar::frameBoxGlobal() {
 
 PHLWINDOW CHyprBar::getOwner() {
     return m_pWindow.lock();
+}
+
+void CHyprBar::setTitle(std::optional<std::string> title) {
+    m_forcedTitle = std::move(title);
+    damageEntire();
 }
 
 void CHyprBar::updateRules() {

@@ -4,7 +4,8 @@
 
 #include <any>
 #include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/config/ConfigManager.hpp>
 #include <hyprland/src/config/shared/parserUtils/ParserUtils.hpp>
@@ -33,11 +34,11 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 }
 
 static void onNewWindow(PHLWINDOW window) {
-    if (!window->m_X11DoesntWantBorders) {
-        if (std::ranges::any_of(window->m_windowDecorations, [](const auto& d) { return d->getDisplayName() == "Hyprbar"; }))
+    if (true) {
+        if (std::ranges::any_of(window->presentation().decorations(), [](const auto& d) { return d->getDisplayName() == "Hyprbar"; }))
             return;
 
-        auto bar = makeUnique<CHyprBar>(window);
+        auto bar = Hyprutils::Memory::makeShared<CHyprBar>(window);
         g_pGlobalState->bars.emplace_back(bar);
         bar->m_self = bar;
         HyprlandAPI::addWindowDecoration(PHANDLE, window, std::move(bar));
@@ -64,7 +65,7 @@ static void onUpdateWindowRules(PHLWINDOW window) {
         return;
 
     (*BARIT)->updateRules();
-    window->updateWindowDecos();
+    window->updateWindowData();
 }
 
 Hyprlang::CParseResult onNewButton(const char* K, const char* V) {
@@ -143,6 +144,19 @@ Hyprlang::CParseResult onNewButton(const char* K, const char* V) {
 // Restoring is deliberately NOT here. A minimized window has no bar on screen
 // to click, so the way back has to be something that can see windows the user
 // cannot -- os99-minimize restore, or the bar widget that calls it.
+int setLuaTitle(lua_State* L) {
+    const auto WINDOW = Config::Lua::Bindings::Internal::windowFromLuaSelectorOrObject(L, 1, "hl.plugin.hyprbars.set_title");
+    if (!WINDOW)
+        return Config::Lua::Bindings::Internal::configError(L, "hl.plugin.hyprbars.set_title: expected a window");
+
+    const auto BARIT = std::ranges::find_if(g_pGlobalState->bars, [&WINDOW](const auto& bar) { return bar && bar->getOwner() == WINDOW; });
+    if (BARIT == g_pGlobalState->bars.end())
+        return Config::Lua::Bindings::Internal::configError(L, "hl.plugin.hyprbars.set_title: the window has no bar");
+
+    (*BARIT)->setTitle(lua_isnoneornil(L, 2) ? std::nullopt : std::optional<std::string>{luaL_checkstring(L, 2)});
+    return 0;
+}
+
 int luaMinimize(lua_State* L) {
     const auto WINDOW = Desktop::focusState()->window();
     if (!WINDOW)
@@ -383,6 +397,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // `hyprctl reload`, which is where a default of true resurrected them.
     g_pGlobalState->config.enabled             = makeShared<Config::Values::CBoolValue>("plugin:hyprbars:enabled", "Whether bars are enabled", false);
     g_pGlobalState->config.iconOnHover         = makeShared<Config::Values::CBoolValue>("plugin:hyprbars:icon_on_hover", "Whether to use an icon on hover of the buttons", false);
+    g_pGlobalState->config.buttonsOnHover      = makeShared<Config::Values::CBoolValue>(
+        "plugin:hyprbars:buttons_on_hover", "Whether the buttons are only drawn while the cursor is over the bar", false);
     g_pGlobalState->config.onDoubleClick       = makeShared<Config::Values::CStringValue>("plugin:hyprbars:on_double_click", "Action to execute on double click of the bar", "");
     // Empty means "the default": $HOME/.local/bin/os99-bar-menu, resolved at
     // click time in barDeco.cpp. Hardcoding the default THERE rather than here
@@ -427,24 +443,23 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.barButtonPadding);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.enabled);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.iconOnHover);
+    HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.buttonsOnHover);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.onDoubleClick);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.barMenuCommand);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.barTooltips);
     HyprlandAPI::addConfigValueV2(PHANDLE, g_pGlobalState->config.barTooltipDelay);
 
-    if (Config::mgr()->type() == Config::CONFIG_LEGACY)
-        HyprlandAPI::addConfigKeyword(PHANDLE, "plugin:hyprbars:hyprbars-button", onNewButton, Hyprlang::SHandlerOptions{});
-    else
-        HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "add_button", ::newLuaButton);
-        HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "clear_buttons", ::clearLuaButtons);
-        HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "shade", ::luaShade);
-        HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "minimize", ::luaMinimize);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "add_button", ::newLuaButton);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "clear_buttons", ::clearLuaButtons);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "shade", ::luaShade);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "minimize", ::luaMinimize);
+    HyprlandAPI::addLuaFunction(PHANDLE, "hyprbars", "set_title", ::setLuaTitle);
     static auto P4 = Event::bus()->m_events.config.preReload.listen([&] { onPreConfigReload(); });
     static auto P5 = Event::bus()->m_events.config.reloaded.listen([&] { onConfigReloaded(); });
 
     // add deco to existing windows
     for (auto& w : Desktop::windowState()->windows()) {
-        if (w->isHidden() || !w->m_isMapped)
+        if (w->isHidden() || !validMapped(w))
             continue;
 
         onNewWindow(w);
@@ -466,7 +481,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     for (auto& m : State::monitorState()->monitors())
         m->m_scheduledRecalc = true;
 
-    g_pHyprRenderer->m_renderPass.removeAllOfType("CBarPassElement");
+    g_pHyprRenderer->context().m_pass.removeAllOfType("CBarPassElement");
 
     // REMOVE THE DECORATIONS. This is not optional, and an earlier version of
     // this file wrongly claimed it was.

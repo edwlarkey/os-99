@@ -14,4 +14,4 @@ upstream hyprbars.
 - **`frame_force_square` / `frame_force_flat`** — rounding 0, no blur/dim.
 - **Teardown guards** so unloading the plugin does not abort the compositor.
 
-Built against Hyprland 0.56.2+. `./install` compiles it against your headers.
+Built against Hyprland 0.57. `os99 rebuild` compiles it against your headers.
